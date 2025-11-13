@@ -2,147 +2,135 @@ from flask import Flask, request
 import requests
 import os
 import sys
-from typing import Dict, Set
 
 app = Flask(__name__)
 
-# ==========================
-# ENV VARS
-# ==========================
+# -----------------------------
+# ENV VARS (Render)
+# -----------------------------
 SMSTOOLS_CLIENT_ID = os.environ.get("SMSTOOLS_CLIENT_ID")
 SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
 SENDER_NUMBER = os.environ.get("SMSTOOLS_SENDER_NUMBER", "32460260667")
 
-# Retell
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
 RETELL_AGENT_ID = os.environ.get("RETELL_AGENT_ID")  # bv. agent_41c11a24d9c427ef834e778a33
 
-RETELL_BASE_URL = "https://api.retellai.com"
-RETELL_CREATE_CHAT_URL = f"{RETELL_BASE_URL}/create-chat"
-RETELL_CHAT_COMPLETION_URL = f"{RETELL_BASE_URL}/create-chat-completion"
-
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
-
-# Per telefoonnummer houden we 1 Retell-chat bij
-active_chats: Dict[str, str] = {}
-
-# Nummers waarvan het gesprek gestart is via een call
-started_by_call: Set[str] = set()
+RETELL_CHAT_URL = "https://api.retellai.com/v2/create-chat-completion"
 
 
-# ==========================
-# SMS VERSTUREN
-# ==========================
-def send_sms(to_number: str, message: str):
+# -----------------------------
+# SMS versturen
+# -----------------------------
+def send_sms(to_number, message):
     payload = {
         "message": message,
         "to": to_number,
-        "sender": SENDER_NUMBER,  # Jouw virtueel nummer
+        "sender": SENDER_NUMBER,
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
         "Content-Type": "application/json",
     }
+    response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
+    print(
+        f"➡️ SMS verstuurd naar {to_number}, response: {response.text}",
+        file=sys.stdout,
+        flush=True,
+    )
 
-    resp = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=10)
-    print(f"➡️ SMS verstuurd naar {to_number}, response: {resp.text}",
-          file=sys.stdout, flush=True)
 
+# -----------------------------
+# Retell aanroepen voor SMS
+# -----------------------------
+def ask_retell_via_sms(conversation_id: str, user_message: str) -> str:
+    """
+    conversation_id = telefoonnummer van de klant,
+    zodat Retell de context van het gesprek bewaart.
+    """
 
-# ==========================
-# RETELL HULPFUNCTIES
-# ==========================
-def get_or_create_chat_id(user_key: str):
-    """Zoek bestaande chat voor dit nummer, of maak een nieuwe bij Retell."""
     if not (RETELL_API_KEY and RETELL_AGENT_ID):
-        print("⚠️ RETELL_API_KEY of RETELL_AGENT_ID niet ingesteld; gebruik fallback.",
-              flush=True)
-        return None
-
-    if user_key in active_chats:
-        return active_chats[user_key]
+        print("⚠️ RETELL_API_KEY of RETELL_AGENT_ID ontbreekt", flush=True)
+        return (
+            "Er ging iets mis aan onze kant. "
+            "Kun je je vraag later nog eens sturen?"
+        )
 
     headers = {
         "Authorization": f"Bearer {RETELL_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"agent_id": RETELL_AGENT_ID}
 
-    try:
-        resp = requests.post(
-            RETELL_CREATE_CHAT_URL, json=payload, headers=headers, timeout=10
-        )
-        data = resp.json()
-        chat_id = data.get("chat_id")
-        print(f"🆕 Retell chat aangemaakt voor {user_key}: {chat_id} | raw={data}",
-              flush=True)
-        if chat_id:
-            active_chats[user_key] = chat_id
-        return chat_id
-    except Exception as e:
-        print("❌ Fout bij create-chat:", e, flush=True)
-        return None
-
-
-def ask_retell(user_key: str, user_message: str):
-    """Stuur een bericht naar Retell en krijg een antwoordtekst terug."""
-    chat_id = get_or_create_chat_id(user_key)
-    if not chat_id:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {RETELL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "chat_id": chat_id,
-        "content": user_message,
+    body = {
+        # BELANGRIJK: gebruik de AGENT, niet de LLM ID
+        "agent_id": RETELL_AGENT_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": user_message,
+            }
+        ],
+        # extra context voor Retell (optioneel, maar handig)
+        "metadata": {
+            "channel": "sms",
+            "conversation_id": conversation_id,
+        },
     }
 
     try:
-        resp = requests.post(
-            RETELL_CHAT_COMPLETION_URL, json=payload, headers=headers, timeout=15
-        )
+        resp = requests.post(RETELL_CHAT_URL, json=body, headers=headers, timeout=20)
+        print("📡 Retell response status:", resp.status_code, flush=True)
+        print("📡 Retell raw response:", resp.text, flush=True)
+
+        resp.raise_for_status()
         data = resp.json()
-        print(f"🤖 Retell response voor {user_key}: {data}", flush=True)
 
-        messages = data.get("messages") or []
-        for m in messages:
-            if m.get("role") == "agent":
-                return m.get("content")
+        # Standaard structuur: choices[0].message.content
+        choices = data.get("choices", [])
+        if not choices:
+            return "Ik kon even geen goed antwoord genereren. Kun je je vraag herhalen?"
 
-        if messages:
-            return messages[0].get("content") or str(messages[0])
+        assistant_msg = choices[0].get("message", {})
+        content = assistant_msg.get("content")
+        if not content:
+            return "Ik kon even geen goed antwoord genereren. Kun je je vraag herhalen?"
 
-        return None
+        return content
+
     except Exception as e:
-        print("❌ Fout bij create-chat-completion:", e, flush=True)
-        return None
+        print("❌ Fout bij aanroepen Retell:", e, flush=True)
+        return "Er ging iets mis bij het verwerken van je bericht. Probeer het straks nog eens."
 
 
-# ==========================
+# -----------------------------
 # HEALTH CHECK
-# ==========================
+# -----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 
-# ==========================
-# INBOUND WEBHOOK
-# ==========================
+# -----------------------------
+# INBOUND WEBHOOK ENDPOINT
+# -----------------------------
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     data = request.get_json(force=True)
     print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    event = data[0] if isinstance(data, list) else data
+    # Soms lijst, soms dict
+    if isinstance(data, list):
+        event = data[0]
+    else:
+        event = data
 
     webhook_type = event.get("webhook_type")
-    msg = event.get("message", {}) or {}
+    msg = event.get("message", {})
 
-    # ---------- INKOMENDE SMS ----------
+    # -----------------------------
+    # INKOMENDE SMS
+    # -----------------------------
     if webhook_type == "inbox_message":
         from_number = msg.get("sender")
         to_number = msg.get("receiver")
@@ -150,63 +138,46 @@ def sms_inbound():
 
         print(f"💬 SMS van {from_number} naar {to_number}: {text}", flush=True)
 
-        if not (from_number and text):
-            return "Geen content", 200
+        if from_number and text:
+            # Stuur bericht naar Retell-agent (met Cal.com integratie)
+            assistant_reply = ask_retell_via_sms(from_number, text)
+            send_sms(from_number, assistant_reply)
 
-        # Is dit een vervolg op een call-bericht?
-        if from_number in started_by_call:
-            retell_prompt = (
-                f"De klant reageert nu per SMS op je eerdere korte welkomstboodschap "
-                f"na een gemiste oproep. De klant zegt: '{text}'. "
-                f"Beantwoord de vraag direct, in het Nederlands, en stel jezelf niet opnieuw voor. "
-                f"Houd het bij 1 tot 3 korte zinnen."
-            )
-            # vlag verwijderen na eerste SMS-response
-            started_by_call.discard(from_number)
-        else:
-            # Normale conversatie via SMS
-            retell_prompt = text
+        return "SMS verwerkt", 200
 
-        reply = ask_retell(user_key=from_number, user_message=retell_prompt)
-
-        if not reply:
-            reply = (
-                f"Bedankt voor je bericht: '{text}'. "
-                f"We nemen zo snel mogelijk contact op. – Eleganza"
-            )
-
-        send_sms(from_number, reply)
-        return "SMS conversatie verwerkt", 200
-
-    # ---------- INKOMENDE CALL ----------
+    # -----------------------------
+    # INKOMENDE CALL (CALL FORWARD)
+    # -----------------------------
     if webhook_type in ["call_forward", "callforward", "call_forwarding", "incoming_call"]:
         caller = msg.get("sender")
         receiver = msg.get("receiver")
 
-        print(f"📞 Inkomende oproep van {caller} naar {receiver}", flush=True)
-
-        if not caller:
-            return "Geen caller", 200
-
-        # Onthoud: gesprek gestart via call
-        started_by_call.add(caller)
-
-        # KORT, VAST WELKOM-BERICHT (zonder Retell)
-        welcome_text = (
-            "Hallo, je spreekt met de virtuele assistent van Kapperzaak Eleganza. "
-            "Stuur hier je vraag of gewenste afspraak, dan help ik je graag verder."
+        print(
+            f"📞 Inkomende oproep van {caller} naar {receiver}",
+            flush=True
         )
 
-        send_sms(caller, welcome_text)
-        return "Call event verwerkt", 200
+        if caller:
+            # Alleen een korte uitnodiging sturen; echte conversatie via SMS + Retell
+            call_reply = (
+                "Bedankt om te bellen met Kapperzaak Eleganza. "
+                "Ik ben de virtuele assistent. Je kunt me via sms een vraag sturen "
+                "of laten weten wanneer je een afspraak wilt maken."
+            )
+            send_sms(caller, call_reply)
 
-    # ---------- ONBEKEND TYPE ----------
+        return "Call verwerkt", 200
+
+    # -----------------------------
+    # ONBEKEND TYPE
+    # -----------------------------
     print(f"❓ Onbekend webhook type: {webhook_type}", flush=True)
     return "Onbekend type", 200
 
 
-# ==========================
-# LOCAL RUN
-# ==========================
+# -----------------------------
+# RUN FLASK LOCALLY
+# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
