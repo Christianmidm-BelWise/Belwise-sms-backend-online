@@ -142,10 +142,15 @@ def ask_retell_via_sms(phone_number: str, user_text: str) -> str:
         data = resp.json()
         messages = data.get("messages", [])
 
-        # Zoek eerste agent-antwoord
-        for m in messages:
+        # Pak HET LAATSTE agent-bericht i.p.v. het eerste
+        agent_answer = None
+        for m in reversed(messages):
             if m.get("role") == "agent" and m.get("content"):
-                return m["content"].strip()
+                agent_answer = m["content"].strip()
+                break
+
+        if agent_answer:
+            return agent_answer
 
         # Fallback als er geen duidelijke agenttekst is
         return (
@@ -159,6 +164,7 @@ def ask_retell_via_sms(phone_number: str, user_text: str) -> str:
             "Er ging iets mis bij het verwerken van je bericht. "
             "Probeer het straks nog eens."
         )
+
 
 
 # -----------------------------
