@@ -1,193 +1,82 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import requests
 import os
-import sys
 
 app = Flask(__name__)
 
-# -----------------------------
-#  Config uit environment
-# -----------------------------
-SMSTOOLS_CLIENT_ID = os.environ.get("SMSTOOLS_CLIENT_ID")
-SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ELEGANZA_KEY = os.getenv("ELEGANZA_KEY")
+RETELL_API_KEY = os.getenv("RETELL_API_KEY")
+RETELL_AGENT_ID = os.getenv("RETELL_AGENT_ID")
 
-# Retell
-RETELL_API_KEY = os.environ.get("RETELL_API_KEY")      # jouw secret key uit Retell
-RETELL_AGENT_ID = os.environ.get("RETELL_AGENT_ID")    # bv. agent_41c11a24d9c427ef834e778a33
+# -------------------------
+# 1. Inkomende BelWise Webhook
+# -------------------------
+@app.route("/sms/inbound", methods=["POST"])
+def inbound():
+    data = request.json
+    print("📥 Ontvangen data:", data)
 
-# LET OP: deze URL MOET je zelf invullen volgens de officiële Retell-documentatie.
-# Ik kan hun exacte endpoint niet betrouwbaar uit de zoekresultaten halen.
-RETELL_TEXT_API_URL = os.environ.get(
-    "RETELL_TEXT_API_URL",
-    "https://api.retellai.com/…VUL_HIER_HET_JUISTE_PAD_IN…"
-)
+    # Validate secret
+    if data.get("secret") != SECRET_KEY:
+        return jsonify({"error": "Invalid secret"}), 403
 
-SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
+    msg = data.get("message", {})
+    caller = msg.get("sender")          # wie belt
+    receiver = msg.get("receiver")      # jouw nummer
+    content = msg.get("content", "")
 
+    print(f"📞 Inkomende oproep van {caller} naar {receiver}")
 
-# -----------------------------
-#  Helper: SMS versturen
-# -----------------------------
-def send_sms(to_number: str, message: str):
-    """
-    Stuurt een SMS via Smstools / SMSGatewayAPI.
-    GEEN 'sender' meesturen => dan gebruikt Smstools je virtueel nummer.
-    """
-    payload = {
-        "message": message,
-        "to": to_number,
-    }
-    headers = {
-        "X-Client-Id": SMSTOOLS_CLIENT_ID,
-        "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
-    print("📤 SMS verstuurd, response:", resp.text, file=sys.stdout, flush=True)
+    # -------------------------
+    # 2. SMS terugsturen via Eleganza
+    # -------------------------
+    sms_body = f"Hallo! Uw oproep is ontvangen. Wat kan ik voor u doen?"
 
-
-# -----------------------------
-#  Helper: vraag Retell om een antwoord
-# -----------------------------
-def get_retell_reply(user_message: str, phone_number: str) -> str:
-    """
-    Stuurt de inkomende SMS naar Retell en geeft de tekstuele reply terug.
-    De exacte JSON-vorm & endpoint moeten worden afgestemd op de Retell-API docs.
-    Daarom is dit bewust generiek gehouden.
-    """
-
-    fallback_reply = (
-        f"Bedankt voor je bericht: '{user_message}'. "
-        f"We nemen zo snel mogelijk contact op. – Bel Wise"
+    sms_response = requests.post(
+        "https://api.eleganza.be/sms/send",
+        headers={"Authorization": f"Bearer {ELEGANZA_KEY}"},
+        json={
+            "to": caller,
+            "message": sms_body,
+            "from": "Eleganza"  # max 11 chars!
+        }
     )
 
-    # Als Retell nog niet geconfigureerd is, gewoon fallback gebruiken.
-    if not (RETELL_API_KEY and RETELL_AGENT_ID and RETELL_TEXT_API_URL):
-        print("⚠️ Retell niet volledig geconfigureerd, gebruik fallback.", flush=True)
-        return fallback_reply
+    print("➡️ SMS verstuurd:", sms_response.text)
 
-    try:
-        payload = {
-            "agent_id": RETELL_AGENT_ID,
-            # Dit is een GENERIEK voorbeeld. Check in Retell-docs
-            # welke velden exact nodig zijn.
-            "messages": [
-                {"role": "user", "content": user_message}
-            ],
-            "metadata": {
-                "channel": "sms",
-                "phone": phone_number,
-            },
+    return jsonify({"status": "ok"})
+
+
+# -------------------------
+# 3. Outbound call starten via Retell
+# -------------------------
+@app.route("/call/start", methods=["POST"])
+def start_call():
+    body = request.json
+    to_number = body.get("to")  # bv: "+324xxxxxxxx"
+
+    response = requests.post(
+        "https://api.retellai.com/v2/create-phone-call",
+        headers={"Authorization": f"Bearer {RETELL_API_KEY}"},
+        json={
+            "from_number": "+12029420324",  # Dit is je Retell nummer
+            "to_number": to_number,
+            "override_agent_id": RETELL_AGENT_ID
         }
+    )
 
-        headers = {
-            "Authorization": f"Bearer {RETELL_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        resp = requests.post(
-            RETELL_TEXT_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-
-        print("🔁 Retell response:", resp.status_code, resp.text, flush=True)
-
-        data = resp.json()
-
-        # De volgende regels zijn ook generiek omdat ik de exacte structuur
-        # van het antwoord niet mag gokken. Pas dit aan volgens de docs.
-        reply = (
-            data.get("reply")
-            or data.get("content")
-            or data.get("message")
-            or ""
-        ).strip()
-
-        if not reply:
-            print("⚠️ Geen bruikbare reply gevonden in Retell-antwoord, gebruik fallback.", flush=True)
-            return fallback_reply
-
-        return reply
-
-    except Exception as e:
-        print("❌ Fout bij aanroepen Retell:", repr(e), flush=True)
-        return fallback_reply
+    return jsonify(response.json())
 
 
-# -----------------------------
-#  Health check
-# -----------------------------
 @app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
+def home():
+    return "Eleganza SMS + Retell backend draait!"
 
 
-# -----------------------------
-#  Hoofd-webhook voor Smstools
-# -----------------------------
-@app.route("/sms/inbound", methods=["POST"])
-def sms_inbound():
-    data = request.get_json(force=True)
-    print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
-
-    # Soms lijst, soms dict
-    if isinstance(data, list):
-        event = data[0]
-    else:
-        event = data
-
-    webhook_type = event.get("webhook_type")
-    msg = event.get("message", {}) or {}
-
-    # -----------------------
-    # INKOMENDE SMS
-    # -----------------------
-    if webhook_type == "inbox_message":
-        from_number = msg.get("sender")
-        to_number = msg.get("receiver")
-        text = (msg.get("content") or "").strip()
-
-        print(f"📩 SMS van {from_number} naar {to_number}: {text}", flush=True)
-
-        if from_number and text:
-            # Vraag Retell om een antwoord (of fallback)
-            reply_text = get_retell_reply(text, from_number)
-            send_sms(from_number, reply_text)
-
-        return "SMS verwerkt", 200
-
-    # -----------------------
-    # CALL FORWARDING
-    # -----------------------
-    if webhook_type == "call_forwarding":
-        caller = msg.get("sender")
-        receiver = msg.get("receiver")
-        print(
-            f"📞 Inkomende oproep van {caller} naar {receiver}",
-            flush=True,
-        )
-
-        if caller:
-            call_reply = (
-                "Bedankt om contact op te nemen met Eleganza. "
-                "Ik ben de virtuele assistent. Wat kan ik voor u doen?"
-            )
-            send_sms(caller, call_reply)
-
-        return "Call verwerkt", 200
-
-    # -----------------------
-    # Onbekend type
-    # -----------------------
-    print(f"❓ Onbekend webhook type: {webhook_type}", flush=True)
-    return "Onbekend type", 200
-
-
-# Alleen lokaal relevant; op Render start gunicorn
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
