@@ -11,56 +11,75 @@ SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
 
 def send_sms(to_number, message):
-    payload = {"message": message, "to": to_number, "sender": "Eleganza"}
+    payload = {"message": message, "to": to_number}
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
         "Content-Type": "application/json",
     }
-
     response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
-    print("SMS verstuurd, response:", response.text, flush=True)
+    print("SMS verstuurd, response:", response.text, file=sys.stdout, flush=True)
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
 
 
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     data = request.get_json(force=True)
-    print("Ontvangen data:", data, flush=True)
+    print("Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    event = data[0] if isinstance(data, list) else data
+    # Soms is data een lijst, soms een dict
+    if isinstance(data, list):
+        event = data[0]
+    else:
+        event = data
+
     webhook_type = event.get("webhook_type")
+    msg = event.get("message", {})
 
-    # ============================
-    # 📩 1. INKOMENDE SMS
-    # ============================
+    # ---------------------------
+    # INKOMENDE SMS
+    # ---------------------------
     if webhook_type == "inbox_message":
-        msg = event.get("message", {})
-        sender = msg.get("sender")
+        from_number = msg.get("sender")
+        to_number = msg.get("receiver")
         text = (msg.get("content") or "").strip()
 
-        print(f"SMS van {sender}: {text}", flush=True)
+        print(f"SMS van {from_number} naar {to_number}: {text}", flush=True)
 
-        antwoord = (
-            f"Bedankt voor je bericht: '{text}'. "
-            f"We nemen zo snel mogelijk contact op. – Eleganza"
-        )
-        send_sms(sender, antwoord)
-        return "OK", 200
+        if from_number and text:
+            antwoord = (
+                f"Bedankt voor je bericht: '{text}'. "
+                f"We nemen zo snel mogelijk contact op. – Bel Wise"
+            )
+            send_sms(from_number, antwoord)
 
-    # ============================
-    # 📞 2. INKOMENDE OPROEP
-    # ============================
-    if webhook_type == "call_forward":
-        caller = event.get("caller")
-        print(f"Inkomende oproep van: {caller}", flush=True)
+        return "SMS verwerkt", 200
 
-        antwoord = (
-            "Bedankt om contact op te nemen met Eleganza. "
-            "Ik ben de virtuele assistent van Eleganza. "
-            "Wat kan ik voor u doen?"
-        )
-        send_sms(caller, antwoord)
-        return "OK", 200
+    # ---------------------------
+    # INKOMENDE CALL (CALL FORWARD)
+    # ---------------------------
+    if webhook_type in ["call_forward", "callforward", "incoming_call"]:
+        caller = msg.get("sender")
+        print(f"Inkomende oproep van {caller}", flush=True)
 
-    return "Unknown event", 200
+        if caller:
+            call_reply = (
+                "Bedankt om contact op te nemen met Eleganza. "
+                "Ik ben de virtuele assistent. Wat kan ik voor u doen?"
+            )
+            send_sms(caller, call_reply)
+
+        return "Call verwerkt", 200
+
+    print("Onbekend webhook type:", webhook_type, flush=True)
+    return "Onbekend type", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
 
