@@ -2,7 +2,7 @@ from flask import Flask, request
 import requests
 import os
 import sys
-from typing import Dict
+from typing import Dict, Set
 
 app = Flask(__name__)
 
@@ -25,6 +25,9 @@ SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
 # Per telefoonnummer houden we 1 Retell-chat bij
 active_chats: Dict[str, str] = {}
+
+# Nummers waarvan het gesprek gestart is via een call
+started_by_call: Set[str] = set()
 
 
 # ==========================
@@ -65,10 +68,7 @@ def get_or_create_chat_id(user_key: str) -> str | None:
         "Authorization": f"Bearer {RETELL_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "agent_id": RETELL_AGENT_ID,
-        # optioneel: metadata of dynamic vars
-    }
+    payload = {"agent_id": RETELL_AGENT_ID}
 
     try:
         resp = requests.post(
@@ -109,12 +109,10 @@ def ask_retell(user_key: str, user_message: str) -> str | None:
         print(f"🤖 Retell response voor {user_key}: {data}", flush=True)
 
         messages = data.get("messages") or []
-        # we nemen de eerste agent-boodschap
         for m in messages:
             if m.get("role") == "agent":
                 return m.get("content")
 
-        # fallback: als structuur anders is
         if messages:
             return messages[0].get("content") or str(messages[0])
 
@@ -140,7 +138,6 @@ def sms_inbound():
     data = request.get_json(force=True)
     print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    # Soms lijst, soms dict
     event = data[0] if isinstance(data, list) else data
 
     webhook_type = event.get("webhook_type")
@@ -157,12 +154,23 @@ def sms_inbound():
         if not (from_number and text):
             return "Geen content", 200
 
-        # Conversatie via Retell
-        retell_prompt = text  # gewoon de tekst van de klant
+        # Is dit een vervolg op een call-bericht?
+        if from_number in started_by_call:
+            retell_prompt = (
+                f"De klant reageert nu per SMS op je eerdere welkomstbericht "
+                f"na een gemiste oproep. De klant zegt: '{text}'. "
+                f"Beantwoord de vraag direct en stel jezelf niet opnieuw voor. "
+                f"Gebruik een vriendelijke, professionele toon."
+            )
+            # vlag verwijderen na eerste SMS-response
+            started_by_call.discard(from_number)
+        else:
+            # Normale conversatie via SMS
+            retell_prompt = text
+
         reply = ask_retell(user_key=from_number, user_message=retell_prompt)
 
         if not reply:
-            # simpele backup als Retell faalt
             reply = (
                 f"Bedankt voor je bericht: '{text}'. "
                 f"We nemen zo snel mogelijk contact op. – Eleganza"
@@ -181,22 +189,24 @@ def sms_inbound():
         if not caller:
             return "Geen caller", 200
 
-        # We willen GEEN terugbel-call starten, enkel een SMS sturen.
-        # We gebruiken Retell om de eerste SMS op te stellen.
+        # Zorg dat Retell weet dat dit nummer via een call gestart is
+        started_by_call.add(caller)
+
+        # Laat Retell één eerste welkomst-SMS schrijven
         system_msg = (
             "Een klant heeft net telefonisch contact proberen opnemen met "
             "kapsalon Eleganza. Stel één vriendelijke SMS op in het Nederlands, "
-            "waarin je je voorstelt als virtuele assistent en vraagt hoe je kunt helpen. "
-            "Gebruik maximaal 2 zinnen."
+            "waarin je je kort voorstelt als virtuele assistent en zegt dat de klant "
+            "via SMS kan antwoorden met zijn/haar vraag of afspraakverzoek."
         )
 
         reply = ask_retell(user_key=caller, user_message=system_msg)
 
         if not reply:
-            # fallback tekst als Retell niet werkt
             reply = (
                 "Bedankt om contact op te nemen met Eleganza. "
-                "Ik ben de virtuele assistent. Waarmee kan ik u helpen?"
+                "Je kan in deze SMS-conversatie je vraag of afspraak doorsturen, "
+                "dan help ik je graag verder."
             )
 
         send_sms(caller, reply)
@@ -212,4 +222,5 @@ def sms_inbound():
 # ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
