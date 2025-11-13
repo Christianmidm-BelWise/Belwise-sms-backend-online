@@ -1,11 +1,13 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import requests
 import os
 import sys
 
 app = Flask(__name__)
 
-# ENV variables
+# =========================================
+#  SMS Tools (BelWise / smsgatewayapi) ENV
+# =========================================
 SMSTOOLS_CLIENT_ID = os.environ.get("SMSTOOLS_CLIENT_ID")
 SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
 
@@ -14,15 +16,22 @@ SENDER_NUMBER = os.environ.get("SMSTOOLS_SENDER_NUMBER", "32460260667")
 
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
+# =========================================
+#  Retell AI ENV
+# =========================================
+RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
+RETELL_AGENT_ID = os.environ.get("RETELL_AGENT_ID")          # bv agent_xxxxx
+RETELL_FROM_NUMBER = os.environ.get("RETELL_FROM_NUMBER")    # jouw Retell nummer, bv "+1202..."
+ENABLE_RETELL_CALLBACK = os.environ.get("ENABLE_RETELL_CALLBACK", "0")
 
-# -----------------------------
-# SMS versturen functie
-# -----------------------------
+# =========================================
+#  SMS versturen via SMS Tools
+# =========================================
 def send_sms(to_number, message):
     payload = {
         "message": message,
         "to": to_number,
-        "sender": SENDER_NUMBER  # JOUW nummer als afzender (vereist!)
+        "sender": SENDER_NUMBER,  # JOUW nummer als afzender (vereist!)
     }
 
     headers = {
@@ -38,18 +47,47 @@ def send_sms(to_number, message):
         flush=True,
     )
 
+# =========================================
+#  Retell outbound call helper
+# =========================================
+def start_retell_call(to_number):
+    """
+    Start een outbound call via Retell AI naar 'to_number'
+    """
+    if not (RETELL_API_KEY and RETELL_AGENT_ID and RETELL_FROM_NUMBER):
+        print("⚠️ Retell config ontbreekt, call niet gestart", flush=True)
+        return
 
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
+    headers = {
+        "Authorization": f"Bearer {RETELL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "from_number": RETELL_FROM_NUMBER,
+        "to_number": to_number,
+        "override_agent_id": RETELL_AGENT_ID,
+    }
+
+    resp = requests.post(
+        "https://api.retellai.com/v2/create-phone-call",
+        json=body,
+        headers=headers,
+        timeout=15,
+    )
+
+    print(f"📞 Retell call response: {resp.status_code} {resp.text}", flush=True)
+
+# =========================================
+#  HEALTH CHECK
+# =========================================
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
-
-# -----------------------------
-# INBOUND WEBHOOK ENDPOINT
-# -----------------------------
+# =========================================
+#  INBOUND WEBHOOK ENDPOINT (SMS Tools)
+# =========================================
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     data = request.get_json(force=True)
@@ -95,12 +133,18 @@ def sms_inbound():
             flush=True
         )
 
+        # SMS terug
         if caller:
             call_reply = (
                 "Bedankt om contact op te nemen met Eleganza. "
                 "Ik ben de virtuele assistent. Wat kan ik voor u doen?"
             )
             send_sms(caller, call_reply)
+
+            # Optioneel: Retell AI belt automatisch terug
+            if ENABLE_RETELL_CALLBACK == "1":
+                print("🚀 Retell callback geactiveerd, call wordt gestart...", flush=True)
+                start_retell_call(caller)
 
         return "Call verwerkt", 200
 
@@ -110,43 +154,26 @@ def sms_inbound():
     print(f"❓ Onbekend webhook type: {webhook_type}", flush=True)
     return "Onbekend type", 200
 
-
-# -----------------------------
-# RUN FLASK LOCALLY
-# -----------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
-
-# -------------------------
-# 3. Outbound call starten via Retell
-# -------------------------
+# =========================================
+#  API om handmatig een Retell call te starten
+# =========================================
 @app.route("/call/start", methods=["POST"])
-def start_call():
-    body = request.json
-    to_number = body.get("to")  # bv: "+324xxxxxxxx"
+def call_start():
+    """
+    Body JSON:
+    { "to": "32456776180" }   # zonder +, of met +, afhankelijk van jouw Retell config
+    """
+    body = request.get_json(force=True)
+    to_number = body.get("to")
 
-    response = requests.post(
-        "https://api.retellai.com/v2/create-phone-call",
-        headers={"Authorization": f"Bearer {RETELL_API_KEY}"},
-        json={
-            "from_number": "+12029420324",  # Dit is je Retell nummer
-            "to_number": to_number,
-            "override_agent_id": RETELL_AGENT_ID
-        }
-    )
+    if not to_number:
+        return jsonify({"error": "to is required"}), 400
 
-    return jsonify(response.json())
+    start_retell_call(to_number)
+    return jsonify({"status": "started", "to": to_number})
 
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Eleganza SMS + Retell backend draait!"
-
-
+# =========================================
+#  RUN FLASK LOCALLY
+# =========================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
-
-
