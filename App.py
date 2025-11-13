@@ -11,7 +11,11 @@ SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
 
 def send_sms(to_number, message):
-    payload = {"message": message, "to": to_number, "sender": "BelWise"}
+    payload = {
+        "message": message,
+        "to": to_number,
+        "sender": "32460260667"   # <-- jouw nummer als afzender
+    }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
