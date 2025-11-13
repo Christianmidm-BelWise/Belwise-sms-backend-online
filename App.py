@@ -53,7 +53,7 @@ def send_sms(to_number: str, message: str):
 # ==========================
 # RETELL HULPFUNCTIES
 # ==========================
-def get_or_create_chat_id(user_key: str) -> str | None:
+def get_or_create_chat_id(user_key: str):
     """Zoek bestaande chat voor dit nummer, of maak een nieuwe bij Retell."""
     if not (RETELL_API_KEY and RETELL_AGENT_ID):
         print("⚠️ RETELL_API_KEY of RETELL_AGENT_ID niet ingesteld; gebruik fallback.",
@@ -63,7 +63,6 @@ def get_or_create_chat_id(user_key: str) -> str | None:
     if user_key in active_chats:
         return active_chats[user_key]
 
-    # Nieuwe chat aanmaken
     headers = {
         "Authorization": f"Bearer {RETELL_API_KEY}",
         "Content-Type": "application/json",
@@ -86,7 +85,7 @@ def get_or_create_chat_id(user_key: str) -> str | None:
         return None
 
 
-def ask_retell(user_key: str, user_message: str) -> str | None:
+def ask_retell(user_key: str, user_message: str):
     """Stuur een bericht naar Retell en krijg een antwoordtekst terug."""
     chat_id = get_or_create_chat_id(user_key)
     if not chat_id:
@@ -157,10 +156,10 @@ def sms_inbound():
         # Is dit een vervolg op een call-bericht?
         if from_number in started_by_call:
             retell_prompt = (
-                f"De klant reageert nu per SMS op je eerdere welkomstbericht "
+                f"De klant reageert nu per SMS op je eerdere korte welkomstboodschap "
                 f"na een gemiste oproep. De klant zegt: '{text}'. "
-                f"Beantwoord de vraag direct en stel jezelf niet opnieuw voor. "
-                f"Gebruik een vriendelijke, professionele toon."
+                f"Beantwoord de vraag direct, in het Nederlands, en stel jezelf niet opnieuw voor. "
+                f"Houd het bij 1 tot 3 korte zinnen."
             )
             # vlag verwijderen na eerste SMS-response
             started_by_call.discard(from_number)
@@ -189,27 +188,16 @@ def sms_inbound():
         if not caller:
             return "Geen caller", 200
 
-        # Zorg dat Retell weet dat dit nummer via een call gestart is
+        # Onthoud: gesprek gestart via call
         started_by_call.add(caller)
 
-        # Laat Retell één eerste welkomst-SMS schrijven
-        system_msg = (
-            "Een klant heeft net telefonisch contact proberen opnemen met "
-            "kapsalon Eleganza. Stel één vriendelijke SMS op in het Nederlands, "
-            "waarin je je kort voorstelt als virtuele assistent en zegt dat de klant "
-            "via SMS kan antwoorden met zijn/haar vraag of afspraakverzoek."
+        # KORT, VAST WELKOM-BERICHT (zonder Retell)
+        welcome_text = (
+            "Hallo, je spreekt met de virtuele assistent van Kapperzaak Eleganza. "
+            "Stuur hier je vraag of gewenste afspraak, dan help ik je graag verder."
         )
 
-        reply = ask_retell(user_key=caller, user_message=system_msg)
-
-        if not reply:
-            reply = (
-                "Bedankt om contact op te nemen met Eleganza. "
-                "Je kan in deze SMS-conversatie je vraag of afspraak doorsturen, "
-                "dan help ik je graag verder."
-            )
-
-        send_sms(caller, reply)
+        send_sms(caller, welcome_text)
         return "Call event verwerkt", 200
 
     # ---------- ONBEKEND TYPE ----------
@@ -222,5 +210,3 @@ def sms_inbound():
 # ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
