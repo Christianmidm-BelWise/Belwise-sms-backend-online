@@ -28,16 +28,20 @@ def health():
 
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
-    # JSON van SmsTools is een LIJST met één object
     data = request.get_json(force=True)
     print("Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    event = data[0]           # eerste (enige) event
-    msg = event["message"]
+    # Soms is data een lijst, soms een dict. We ondersteunen beide.
+    if isinstance(data, list):
+        event = data[0]
+    else:
+        event = data
 
-    from_number = msg["sender"]
-    to_number = msg["receiver"]
-    text = (msg["content"] or "").strip()
+    msg = event.get("message", {})
+
+    from_number = msg.get("sender")
+    to_number = msg.get("receiver")
+    text = (msg.get("content") or "").strip()
 
     print(
         f"SMS van {from_number} naar {to_number}: {text}",
