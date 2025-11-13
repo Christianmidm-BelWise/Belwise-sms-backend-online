@@ -5,17 +5,26 @@ import sys
 
 app = Flask(__name__)
 
+# ENV variables
 SMSTOOLS_CLIENT_ID = os.environ.get("SMSTOOLS_CLIENT_ID")
 SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
+
+# Dit MOET jouw virtueel nummer zijn
+SENDER_NUMBER = os.environ.get("SMSTOOLS_SENDER_NUMBER", "32460260667")
+
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
 
+# -----------------------------
+# SMS versturen functie
+# -----------------------------
 def send_sms(to_number, message):
-    """Stuur een SMS via Smstools."""
     payload = {
         "message": message,
-        "to": to_number,      # GEEN 'sender' => dan gebruikt Smstools je nummer
+        "to": to_number,
+        "sender": SENDER_NUMBER  # JOUW nummer als afzender (vereist!)
     }
+
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
@@ -23,59 +32,68 @@ def send_sms(to_number, message):
     }
 
     response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
-    print(f"➡️ SMS verstuurd naar {to_number}, response: {response.text}",
-          file=sys.stdout, flush=True)
+    print(
+        f"➡️ SMS verstuurd naar {to_number}, response: {response.text}",
+        file=sys.stdout,
+        flush=True,
+    )
 
 
+# -----------------------------
+# HEALTH CHECK
+# -----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 
+# -----------------------------
+# INBOUND WEBHOOK ENDPOINT
+# -----------------------------
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     data = request.get_json(force=True)
     print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    # Soms is data een lijst, soms een dict
+    # Soms lijst, soms dict
     if isinstance(data, list):
         event = data[0]
     else:
-        event = data or {}
+        event = data
 
     webhook_type = event.get("webhook_type")
     msg = event.get("message", {})
 
-    # ---------------------------
-    # 1️⃣ INKOMENDE SMS
-    # ---------------------------
+    # -----------------------------
+    # INKOMENDE SMS
+    # -----------------------------
     if webhook_type == "inbox_message":
         from_number = msg.get("sender")
         to_number = msg.get("receiver")
         text = (msg.get("content") or "").strip()
 
-        print(f"📩 SMS van {from_number} naar {to_number}: {text}",
-              file=sys.stdout, flush=True)
+        print(f"💬 SMS van {from_number} naar {to_number}: {text}", flush=True)
 
         if from_number and text:
             antwoord = (
                 f"Bedankt voor je bericht: '{text}'. "
-                f"We nemen zo snel mogelijk contact op. - Bel Wise"
+                f"We nemen zo snel mogelijk contact op. – Bel Wise"
             )
             send_sms(from_number, antwoord)
 
         return "SMS verwerkt", 200
 
-    # ---------------------------
-    # 2️⃣ INKOMENDE CALL (CALL FORWARDING)
-    # ---------------------------
-    # LET OP: Smstools stuurt 'call_forwarding'
-    if webhook_type in ["call_forwarding", "call_forward", "incoming_call"]:
+    # -----------------------------
+    # INKOMENDE CALL (CALL FORWARD)
+    # -----------------------------
+    if webhook_type in ["call_forward", "callforward", "call_forwarding", "incoming_call"]:
         caller = msg.get("sender")
-        to_number = msg.get("receiver")
+        receiver = msg.get("receiver")
 
-        print(f"📞 Inkomende oproep van {caller} naar {to_number}",
-              file=sys.stdout, flush=True)
+        print(
+            f"📞 Inkomende oproep van {caller} naar {receiver}",
+            flush=True
+        )
 
         if caller:
             call_reply = (
@@ -86,14 +104,17 @@ def sms_inbound():
 
         return "Call verwerkt", 200
 
-    # ---------------------------
-    # Onbekend type
-    # ---------------------------
-    print(f"❓ Onbekend webhook type: {webhook_type}",
-          file=sys.stdout, flush=True)
+    # -----------------------------
+    # ONBEKEND TYPE
+    # -----------------------------
+    print(f"❓ Onbekend webhook type: {webhook_type}", flush=True)
     return "Onbekend type", 200
 
 
+# -----------------------------
+# RUN FLASK LOCALLY
+# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
