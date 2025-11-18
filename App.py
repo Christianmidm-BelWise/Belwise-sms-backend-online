@@ -24,54 +24,60 @@ RETELL_BASE_URL = "https://api.retellai.com"
 # -----------------------------
 # TENANTS (UIT CSV)
 # -----------------------------
-# key = virtual_number (string), value = dict met tenant-info
 TENANTS: Dict[str, Dict[str, Any]] = {}
-
-# key = (tenant_id, phone_number) -> chat_id
+# (tenant_id, phone_number) -> chat_id
 SMS_SESSIONS: Dict[tuple, str] = {}
 
 
+# -----------------------------
+# CSV LADEN (DELIMITER = ';')
+# -----------------------------
 def load_tenants_from_csv(path: str = "tenants.csv") -> None:
     """
     Laadt alle tenant-configs uit tenants.csv in het geheugen.
-    Verwacht kolommen:
-    tenant_id,tenant_name,virtual_number,retell_agent_id,opening_line
+    CSV-indeling (gescheiden door ';'):
+
+    tenant_id;tenant_name;virtual_number;retell_agent_id;opening_line
+    kapper_eleganza;Kapper Eleganza;32460260667;agent_xxx;Je openingszin hier...
     """
     global TENANTS
     TENANTS = {}
 
     if not os.path.exists(path):
-        print(f"⚠️ tenants.csv niet gevonden op pad: {path}", file=sys.stdout, flush=True)
+        print(f"⚠️ tenants.csv niet gevonden op pad {path}", flush=True)
         return
 
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        # BELANGRIJK: delimiter=';' omdat Excel BE/NL puntkomma gebruikt
+        reader = csv.DictReader(f, delimiter=';')
+
         for row in reader:
-            virtual_number = (row.get("virtual_number") or "").strip()
-            if not virtual_number:
-                print(f"⚠️ Rij zonder virtual_number overgeslagen: {row}", flush=True)
+            virtual = (row.get("virtual_number") or "").strip()
+            if not virtual:
+                print("⚠️ Rij zonder virtual_number overgeslagen:", row, flush=True)
                 continue
 
-            tenant_id = (row.get("tenant_id") or "").strip() or virtual_number
-            tenant_name = (row.get("tenant_name") or "").strip() or tenant_id
-            agent_id = (row.get("retell_agent_id") or "").strip()
-            opening_line = (row.get("opening_line") or "").strip()
+            tenant_id = (row.get("tenant_id") or "").strip() or virtual
+            # we proberen zowel 'tenant_name' als 'Tenant_name' (voor de zekerheid)
+            tenant_name = (
+                (row.get("tenant_name") or row.get("Tenant_name") or "").strip()
+                or tenant_id
+            )
 
-            TENANTS[virtual_number] = {
+            TENANTS[virtual] = {
                 "tenant_id": tenant_id,
                 "tenant_name": tenant_name,
-                "virtual_number": virtual_number,
-                "retell_agent_id": agent_id,
-                "opening_line": opening_line,  # optioneel, mag leeg zijn
+                "virtual_number": virtual,
+                "retell_agent_id": (row.get("retell_agent_id") or "").strip(),
+                "opening_line": (row.get("opening_line") or "").strip(),
             }
 
-    print(f"✅ {len(TENANTS)} tenants geladen uit {path}", file=sys.stdout, flush=True)
+    print(f"✅ {len(TENANTS)} tenants geladen uit CSV", flush=True)
+    print(f"🔑 tenant virtual_numbers: {list(TENANTS.keys())}", flush=True)
 
 
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
-    """
-    Zoek de juiste tenant op basis van het 'receiver'-nummer uit de webhook.
-    """
+    """Zoek de juiste tenant op basis van het 'receiver'-nummer uit de webhook."""
     if not receiver:
         return None
     receiver = receiver.strip()
@@ -82,7 +88,7 @@ def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------
-# SMS versturen via Smstools (globale credentials)
+# SMS versturen via Smstools
 # -----------------------------
 def send_sms(to_number: str, message: str) -> None:
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
@@ -92,7 +98,7 @@ def send_sms(to_number: str, message: str) -> None:
     payload = {
         "message": message,
         "to": to_number,
-        "sender": SENDER_NUMBER,  # globale afzender
+        "sender": SENDER_NUMBER,  # globaal afzendernummer
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
@@ -108,7 +114,7 @@ def send_sms(to_number: str, message: str) -> None:
 
 
 # -----------------------------
-# Retell helpers (multi-tenant via agent_id)
+# Retell helpers
 # -----------------------------
 def get_or_create_chat_id(tenant: Dict[str, Any], phone_number: str) -> Optional[str]:
     """
@@ -133,7 +139,6 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone_number: str) -> Optional
     if session_key in SMS_SESSIONS:
         return SMS_SESSIONS[session_key]
 
-    # Nieuwe chat aanmaken
     payload = {
         "agent_id": agent_id,
         "metadata": {
@@ -186,18 +191,19 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone_number: str) -> Optional
 def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, user_text: str) -> str:
     """
     Stuurt de SMS-vraag naar Retell en geeft het antwoord van de agent terug als string.
+    Bij fouten → opening_line of generieke fallback.
     """
     if not RETELL_API_KEY:
         return (
-            "Er ging iets mis bij het verbinden met de virtuele assistent. "
-            "Probeer het later nog eens of bel ons even."
+            tenant.get("opening_line")
+            or "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
         )
 
     chat_id = get_or_create_chat_id(tenant, phone_number)
     if not chat_id:
         return (
-            "Er ging iets mis bij het verbinden met de virtuele assistent. "
-            "Probeer het later nog eens of bel ons even."
+            tenant.get("opening_line")
+            or "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
         )
 
     payload = {
@@ -241,14 +247,14 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, user_text: str
             return agent_answer
 
         return (
-            "Ik kon je vraag niet goed verwerken. "
-            "Kun je het misschien anders formuleren?"
+            tenant.get("opening_line")
+            or "Ik kon je vraag niet goed verwerken. Kun je het misschien anders formuleren?"
         )
     except Exception as e:
         print(f"❌ Fout bij create-chat-completion: {e}", flush=True)
         return (
-            "Er ging iets mis bij het verwerken van je bericht. "
-            "Probeer het straks nog eens."
+            tenant.get("opening_line")
+            or "Er ging iets mis bij het verwerken van je bericht. Probeer het straks nog eens."
         )
 
 
@@ -268,7 +274,7 @@ def sms_inbound():
     data = request.get_json(force=True)
     print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
 
-    # Soms lijst, soms dict
+    # Soms lijst, soms dict (Smstools kan een array sturen)
     if isinstance(data, list):
         event = data[0]
     else:
@@ -281,7 +287,6 @@ def sms_inbound():
     tenant = get_tenant_by_receiver(receiver)
 
     if not tenant:
-        # Geen tenant gevonden: generieke fallback
         print(
             f"❌ Geen tenant-config gevonden voor receiver {receiver}, event wordt genegeerd.",
             flush=True,
@@ -304,15 +309,12 @@ def sms_inbound():
         if not from_number or not text:
             return "Geen geldige SMS", 200
 
-        # Als Retell niet geconfigureerd is (globaal of voor deze tenant), simpele fallback
-        if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
-            if opening_line:
-                fallback = opening_line
-            else:
-                fallback = (
-                    f"Bedankt voor je bericht! De virtuele assistent van {tenant['tenant_name']} "
-                    "is momenteel niet actief. We nemen zo snel mogelijk contact met je op."
-                )
+        # Als Retell niet geconfigureerd is, simpele opening_line-fallback
+        if not tenant.get("retell_agent_id") or not RETELL_API_KEY:
+            fallback = opening_line or (
+                f"Bedankt voor je bericht! De virtuele assistent van {tenant['tenant_name']} "
+                "is momenteel niet actief. We nemen zo snel mogelijk contact met je op."
+            )
             send_sms(from_number, fallback)
             return "SMS verwerkt (fallback)", 200
 
@@ -332,14 +334,11 @@ def sms_inbound():
         )
 
         if caller:
-            if opening_line:
-                call_reply = opening_line
-            else:
-                call_reply = (
-                    f"Bedankt om te bellen met {tenant['tenant_name']}. "
-                    "Ik ben de virtuele assistent. "
-                    "Stuur me gerust een sms met je vraag of wanneer je een afspraak wilt plannen."
-                )
+            call_reply = opening_line or (
+                f"Bedankt om te bellen met {tenant['tenant_name']}. "
+                "Ik ben de virtuele assistent. "
+                "Stuur me gerust een sms met je vraag of wanneer je een afspraak wilt plannen."
+            )
             send_sms(caller, call_reply)
 
         return "Call verwerkt", 200
@@ -361,4 +360,5 @@ load_tenants_from_csv()
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
