@@ -31,9 +31,25 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # TENANTS (CSV)
 # -----------------------------
 TENANTS: Dict[str, Dict[str, Any]] = {}
+# key: (tenant_id, phone) -> chat_id
 SMS_SESSIONS: Dict[tuple, str] = {}
 
 
+# -----------------------------
+# ALWAYS LOG REQUESTS (Render logs)
+# -----------------------------
+@app.before_request
+def _log_every_request():
+    # Dit zorgt dat je ALTIJD "POST /sms/inbound" ziet in Render logs
+    try:
+        print(f"➡️ {request.method} {request.path}", flush=True)
+    except Exception:
+        pass
+
+
+# -----------------------------
+# CSV LADEN
+# -----------------------------
 def load_tenants_from_csv(path: str = "tenants.csv") -> None:
     global TENANTS
     TENANTS = {}
@@ -61,6 +77,7 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
             }
 
     print(f"✅ {len(TENANTS)} tenants geladen", flush=True)
+    print(f"🔑 receivers: {list(TENANTS.keys())}", flush=True)
 
 
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
@@ -77,6 +94,10 @@ def month_key() -> str:
 
 
 def bump_monthly_outbound(tenant_id: str) -> int:
+    """
+    +1 outbound voor deze tenant in deze maand.
+    Return: nieuwe maandtotal.
+    """
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ontbreekt")
 
@@ -98,17 +119,26 @@ def bump_monthly_outbound(tenant_id: str) -> int:
                 "SELECT outbound_count FROM monthly_usage WHERE month=%s AND tenant_id=%s",
                 (mkey, tenant_id),
             )
-            return int(cur.fetchone()[0])
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
 
 
 # -----------------------------
-# SMS VERSTUREN (FIX)
+# SMS VERSTUREN (sender = tenant virtual number)
 # -----------------------------
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
+    if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
+        print("❌ SMSTOOLS_CLIENT_ID/SMSTOOLS_CLIENT_SECRET ontbreken", flush=True)
+        return
+
+    if not to_number:
+        print("❌ send_sms: to_number ontbreekt", flush=True)
+        return
+
     payload = {
         "message": message,
         "to": to_number,
-        "sender": tenant["virtual_number"],  # 🔥 JUISTE FIX
+        "sender": tenant["virtual_number"],  # ✅ juiste fix
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
@@ -116,15 +146,20 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
         "Content-Type": "application/json",
     }
 
-    response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
-    print(f"➡️ SMS van {tenant['virtual_number']} naar {to_number}: {response.text}", flush=True)
-
     try:
-        total = bump_monthly_outbound(tenant["tenant_id"])
+        response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=15)
         print(
-            f"📊 Usage {tenant['tenant_id']} {month_key()} = {total}",
+            f"➡️ SMS van {tenant['virtual_number']} naar {to_number} | status={response.status_code} | body={response.text}",
             flush=True,
         )
+    except Exception as e:
+        print(f"❌ Smstools send failed: {e}", flush=True)
+        return
+
+    # Billing nooit de SMS-flow laten blokkeren
+    try:
+        total = bump_monthly_outbound(tenant["tenant_id"])
+        print(f"📊 Usage tenant={tenant['tenant_id']} month={month_key()} total={total}", flush=True)
     except Exception as e:
         print(f"⚠️ Billing faalde: {e}", flush=True)
 
@@ -133,23 +168,34 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
 # RETELL
 # -----------------------------
 def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
+    if not RETELL_API_KEY:
+        print("⚠️ RETELL_API_KEY ontbreekt", flush=True)
+        return None
+
     key = (tenant["tenant_id"], phone)
     if key in SMS_SESSIONS:
         return SMS_SESSIONS[key]
 
-    resp = requests.post(
-        f"{RETELL_BASE_URL}/create-chat",
-        headers={
-            "Authorization": f"Bearer {RETELL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "agent_id": tenant["retell_agent_id"],
-            "metadata": {"phone": phone},
-        },
-        timeout=10,
-    )
-    data = resp.json()
+    try:
+        resp = requests.post(
+            f"{RETELL_BASE_URL}/create-chat",
+            headers={
+                "Authorization": f"Bearer {RETELL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "agent_id": tenant.get("retell_agent_id"),
+                "metadata": {"phone": phone, "tenant_id": tenant["tenant_id"]},
+            },
+            timeout=15,
+        )
+        print(f"🤖 Retell create-chat status={resp.status_code} body={resp.text}", flush=True)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"❌ Retell create-chat error: {e}", flush=True)
+        return None
+
     chat_id = data.get("chat_id") or data.get("id")
     if chat_id:
         SMS_SESSIONS[key] = chat_id
@@ -157,24 +203,36 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
 
 
 def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
+    opening = tenant.get("opening_line") or "Bedankt voor je bericht."
+    if not tenant.get("retell_agent_id") or not RETELL_API_KEY:
+        return opening
+
     chat_id = get_or_create_chat_id(tenant, phone)
     if not chat_id:
-        return tenant.get("opening_line", "Er ging iets mis.")
+        return opening
 
-    resp = requests.post(
-        f"{RETELL_BASE_URL}/create-chat-completion",
-        headers={
-            "Authorization": f"Bearer {RETELL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={"chat_id": chat_id, "content": text},
-        timeout=15,
-    )
-    data = resp.json()
+    try:
+        resp = requests.post(
+            f"{RETELL_BASE_URL}/create-chat-completion",
+            headers={
+                "Authorization": f"Bearer {RETELL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"chat_id": chat_id, "content": text},
+            timeout=30,
+        )
+        print(f"🤖 Retell completion status={resp.status_code} body={resp.text}", flush=True)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"❌ Retell completion error: {e}", flush=True)
+        return opening
+
     for m in reversed(data.get("messages", [])):
-        if m.get("role") == "agent":
-            return m.get("content", "")
-    return tenant.get("opening_line", "Kan je dat anders formuleren?")
+        if m.get("role") == "agent" and m.get("content"):
+            return (m.get("content") or "").strip()
+
+    return opening
 
 
 # -----------------------------
@@ -187,30 +245,60 @@ def health():
 
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
-    data = request.get_json(force=True)
-    event = data[0] if isinstance(data, list) else data
+    # extra expliciet log, zodat je zeker bent dat dit endpoint geraakt wordt
+    print("✅ /sms/inbound HIT", flush=True)
 
-    msg = event.get("message", {})
-    receiver = msg.get("receiver")
+    data = request.get_json(force=True, silent=True)
+    print("📥 RAW JSON:", data, flush=True)
+
+    if not data:
+        return "No JSON", 200
+
+    event = data[0] if isinstance(data, list) else data
+    webhook_type = (event.get("webhook_type") or "").strip()
+    msg = event.get("message", {}) or {}
+
+    receiver = (msg.get("receiver") or "").strip()
     tenant = get_tenant_by_receiver(receiver)
 
     if not tenant:
+        print(f"❌ Onbekende tenant receiver={receiver}", flush=True)
         return "Onbekende tenant", 200
 
-    from_number = msg.get("sender")
-    text = (msg.get("content") or "").strip()
+    print(f"🏷️ tenant={tenant['tenant_id']} receiver={receiver} webhook_type={webhook_type}", flush=True)
 
-    if event.get("webhook_type") == "inbox_message":
-        if tenant.get("retell_agent_id"):
-            answer = ask_retell_via_sms(tenant, from_number, text)
-        else:
-            answer = tenant.get("opening_line", "Bedankt voor je bericht.")
+    # --- SMS inbox
+    if webhook_type == "inbox_message":
+        from_number = (msg.get("sender") or "").strip()
+        text = (msg.get("content") or "").strip()
+
+        print(f"💬 SMS van {from_number} -> {receiver}: {text}", flush=True)
+
+        if not from_number or not text:
+            return "Invalid SMS", 200
+
+        answer = ask_retell_via_sms(tenant, from_number, text)
         send_sms(tenant, from_number, answer)
+        return "OK", 200
 
-    elif event.get("webhook_type") in ["call_forward", "incoming_call"]:
-        reply = tenant.get("opening_line", "Stuur ons gerust een sms.")
-        send_sms(tenant, msg.get("sender"), reply)
+    # --- Call events (als Smstools die ooit stuurt)
+    # we maken dit expres ruim zodat we het zien in logs, ook als type afwijkt
+    if "call" in webhook_type.lower():
+        caller = (
+            (msg.get("sender") or "")
+            or (msg.get("caller") or "")
+            or (msg.get("from") or "")
+        ).strip()
 
+        print(f"📞 CALL event type={webhook_type} caller={caller} msg_keys={list(msg.keys())}", flush=True)
+
+        if caller:
+            reply = tenant.get("opening_line") or "Stuur ons gerust een sms met je vraag."
+            send_sms(tenant, caller, reply)
+
+        return "OK", 200
+
+    print(f"ℹ️ Onbekend webhook_type={webhook_type}", flush=True)
     return "OK", 200
 
 
@@ -221,4 +309,3 @@ load_tenants_from_csv()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
