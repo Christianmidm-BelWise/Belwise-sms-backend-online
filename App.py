@@ -4,6 +4,8 @@ import os
 import sys
 import csv
 from typing import Dict, Any, Optional
+from datetime import datetime
+import psycopg2
 
 app = Flask(__name__)
 
@@ -20,6 +22,11 @@ SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 # -----------------------------
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
 RETELL_BASE_URL = "https://api.retellai.com"
+
+# -----------------------------
+# ENV VARS - DATABASE (POSTGRES)
+# -----------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # -----------------------------
 # TENANTS (UIT CSV)
@@ -49,7 +56,7 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
 
     with open(path, newline="", encoding="utf-8") as f:
         # BELANGRIJK: delimiter=';' omdat Excel BE/NL puntkomma gebruikt
-        reader = csv.DictReader(f, delimiter=';')
+        reader = csv.DictReader(f, delimiter=";")
 
         for row in reader:
             virtual = (row.get("virtual_number") or "").strip()
@@ -58,10 +65,8 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
                 continue
 
             tenant_id = (row.get("tenant_id") or "").strip() or virtual
-            # we proberen zowel 'tenant_name' als 'Tenant_name' (voor de zekerheid)
             tenant_name = (
-                (row.get("tenant_name") or row.get("Tenant_name") or "").strip()
-                or tenant_id
+                (row.get("tenant_name") or row.get("Tenant_name") or "").strip() or tenant_id
             )
 
             TENANTS[virtual] = {
@@ -88,9 +93,48 @@ def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------
+# USAGE HELPERS (POSTGRES)
+# -----------------------------
+def month_key() -> str:
+    # Per maand tellen (UTC is OK)
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def bump_monthly_outbound(tenant_id: str, inc: int = 1) -> int:
+    """
+    Verhoog outbound_count voor (month, tenant_id) en geef de nieuwe total terug.
+    We tellen 1 per outbound bericht (zoals jij wil).
+    """
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ontbreekt")
+
+    mkey = month_key()
+
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO monthly_usage (month, tenant_id, outbound_count)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (month, tenant_id)
+                DO UPDATE SET outbound_count = monthly_usage.outbound_count + EXCLUDED.outbound_count,
+                              updated_at = NOW()
+                """,
+                (mkey, tenant_id, inc),
+            )
+
+            cur.execute(
+                "SELECT outbound_count FROM monthly_usage WHERE month=%s AND tenant_id=%s",
+                (mkey, tenant_id),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
+
+# -----------------------------
 # SMS versturen via Smstools
 # -----------------------------
-def send_sms(to_number: str, message: str) -> None:
+def send_sms(tenant_id: str, to_number: str, message: str) -> None:
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
         print("❌ SMSTOOLS_CLIENT_ID of SMSTOOLS_CLIENT_SECRET ontbreekt", flush=True)
         return
@@ -98,19 +142,31 @@ def send_sms(to_number: str, message: str) -> None:
     payload = {
         "message": message,
         "to": to_number,
-        "sender": SENDER_NUMBER,  # globaal afzendernummer
+        "sender": SENDER_NUMBER,
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
         "Content-Type": "application/json",
     }
+
+    # 1) Eerst versturen (zodat billing nooit je delivery blokkeert)
     response = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers)
     print(
         f"➡️ SMS verstuurd naar {to_number}, response: {response.text}",
         file=sys.stdout,
         flush=True,
     )
+
+    # 2) Daarna outbound tellen (+1 per bericht)
+    try:
+        new_total = bump_monthly_outbound(tenant_id, 1)
+        print(
+            f"📊 Outbound usage bijgewerkt: tenant={tenant_id} month={month_key()} total={new_total}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"⚠️ Usage tellen faalde voor tenant {tenant_id}: {e}", flush=True)
 
 
 # -----------------------------
@@ -127,10 +183,7 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone_number: str) -> Optional
 
     agent_id = tenant.get("retell_agent_id")
     if not agent_id:
-        print(
-            f"⚠️ Tenant {tenant['tenant_id']} heeft geen retell_agent_id",
-            flush=True,
-        )
+        print(f"⚠️ Tenant {tenant['tenant_id']} heeft geen retell_agent_id", flush=True)
         return None
 
     session_key = (tenant["tenant_id"], phone_number)
@@ -160,16 +213,8 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone_number: str) -> Optional
             headers=headers,
             timeout=10,
         )
-        print(
-            f"📡 [{tenant['tenant_name']}] Retell create-chat status:",
-            resp.status_code,
-            flush=True,
-        )
-        print(
-            f"📡 [{tenant['tenant_name']}] Retell create-chat raw:",
-            resp.text,
-            flush=True,
-        )
+        print(f"📡 [{tenant['tenant_name']}] Retell create-chat status:", resp.status_code, flush=True)
+        print(f"📡 [{tenant['tenant_name']}] Retell create-chat raw:", resp.text, flush=True)
         resp.raise_for_status()
         data = resp.json()
         chat_id = data.get("chat_id") or data.get("id")
@@ -194,16 +239,14 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, user_text: str
     Bij fouten → opening_line of generieke fallback.
     """
     if not RETELL_API_KEY:
-        return (
-            tenant.get("opening_line")
-            or "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
+        return tenant.get("opening_line") or (
+            "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
         )
 
     chat_id = get_or_create_chat_id(tenant, phone_number)
     if not chat_id:
-        return (
-            tenant.get("opening_line")
-            or "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
+        return tenant.get("opening_line") or (
+            "Er ging iets mis bij het verbinden met de virtuele assistent. Probeer later nog eens."
         )
 
     payload = {
@@ -222,16 +265,8 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, user_text: str
             headers=headers,
             timeout=15,
         )
-        print(
-            f"📡 [{tenant['tenant_name']}] Retell completion status:",
-            resp.status_code,
-            flush=True,
-        )
-        print(
-            f"📡 [{tenant['tenant_name']}] Retell completion raw:",
-            resp.text,
-            flush=True,
-        )
+        print(f"📡 [{tenant['tenant_name']}] Retell completion status:", resp.status_code, flush=True)
+        print(f"📡 [{tenant['tenant_name']}] Retell completion raw:", resp.text, flush=True)
         resp.raise_for_status()
         data = resp.json()
         messages = data.get("messages", [])
@@ -246,15 +281,13 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, user_text: str
         if agent_answer:
             return agent_answer
 
-        return (
-            tenant.get("opening_line")
-            or "Ik kon je vraag niet goed verwerken. Kun je het misschien anders formuleren?"
+        return tenant.get("opening_line") or (
+            "Ik kon je vraag niet goed verwerken. Kun je het misschien anders formuleren?"
         )
     except Exception as e:
         print(f"❌ Fout bij create-chat-completion: {e}", flush=True)
-        return (
-            tenant.get("opening_line")
-            or "Er ging iets mis bij het verwerken van je bericht. Probeer het straks nog eens."
+        return tenant.get("opening_line") or (
+            "Er ging iets mis bij het verwerken van je bericht. Probeer het straks nog eens."
         )
 
 
@@ -275,13 +308,10 @@ def sms_inbound():
     print("📥 Ontvangen data:", data, file=sys.stdout, flush=True)
 
     # Soms lijst, soms dict (Smstools kan een array sturen)
-    if isinstance(data, list):
-        event = data[0]
-    else:
-        event = data
+    event = data[0] if isinstance(data, list) and data else data
 
-    webhook_type = event.get("webhook_type")
-    msg = event.get("message", {}) or {}
+    webhook_type = (event or {}).get("webhook_type")
+    msg = (event or {}).get("message", {}) or {}
 
     receiver = msg.get("receiver")  # virtueel nummer van klant
     tenant = get_tenant_by_receiver(receiver)
@@ -315,12 +345,12 @@ def sms_inbound():
                 f"Bedankt voor je bericht! De virtuele assistent van {tenant['tenant_name']} "
                 "is momenteel niet actief. We nemen zo snel mogelijk contact met je op."
             )
-            send_sms(from_number, fallback)
+            send_sms(tenant["tenant_id"], from_number, fallback)
             return "SMS verwerkt (fallback)", 200
 
         # Vraag doorsturen naar Retell
         antwoord = ask_retell_via_sms(tenant, from_number, text)
-        send_sms(from_number, antwoord)
+        send_sms(tenant["tenant_id"], from_number, antwoord)
         return "SMS verwerkt", 200
 
     # --------------------------
@@ -339,7 +369,7 @@ def sms_inbound():
                 "Ik ben de virtuele assistent. "
                 "Stuur me gerust een sms met je vraag of wanneer je een afspraak wilt plannen."
             )
-            send_sms(caller, call_reply)
+            send_sms(tenant["tenant_id"], caller, call_reply)
 
         return "Call verwerkt", 200
 
@@ -360,5 +390,3 @@ load_tenants_from_csv()
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
