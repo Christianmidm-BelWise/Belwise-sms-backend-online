@@ -3,6 +3,7 @@ import os
 import csv
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+import re
 
 import requests
 import psycopg2
@@ -18,7 +19,7 @@ SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
 # -----------------------------
-# ENV VARS - RETELL
+# ENV VARS - RETELL (optioneel)
 # -----------------------------
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
 RETELL_BASE_URL = "https://api.retellai.com"
@@ -26,7 +27,7 @@ RETELL_BASE_URL = "https://api.retellai.com"
 # -----------------------------
 # ENV VARS - DATABASE
 # -----------------------------
-DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+RAW_DATABASE_URL = os.environ.get("DATABASE_URL") or ""
 
 # -----------------------------
 # OPTIONAL ADMIN TOKEN
@@ -44,20 +45,45 @@ def log(msg: str) -> None:
         print(msg, flush=True)
 
 
-# -----------------------------
-# TENANTS (CSV)
-# -----------------------------
-TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}  # virtual_number -> tenant dict
-TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}       # tenant_id -> tenant dict
-SMS_SESSIONS: Dict[Tuple[str, str], str] = {}       # (tenant_id, phone) -> chat_id
-
-
 @app.before_request
 def log_request():
     try:
         log(f"➡️ {request.method} {request.path}")
     except Exception:
         pass
+
+
+def sanitize_database_url(raw: str) -> str:
+    """
+    - trims whitespace/newlines
+    - if multiple URLs accidentally pasted, pick the first postgresql://... token
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(postgres(?:ql)?://\S+)", raw)
+    if m:
+        return m.group(1).strip()
+    return raw.strip()
+
+
+DATABASE_URL = sanitize_database_url(RAW_DATABASE_URL)
+
+# -----------------------------
+# TENANTS (CSV)
+# -----------------------------
+TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}  # normalized virtual_number -> tenant dict
+TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}       # tenant_id -> tenant dict
+SMS_SESSIONS: Dict[Tuple[str, str], str] = {}       # (tenant_id, phone) -> chat_id
+
+
+def normalize_phone(s: str) -> str:
+    """
+    Make phone comparisons robust:
+    - keep digits only
+    """
+    s = (s or "").strip()
+    return re.sub(r"\D+", "", s)
 
 
 def detect_csv_delimiter(path: str) -> str:
@@ -91,23 +117,22 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
-            virtual = (row.get("virtual_number") or "").strip()
-            if not virtual:
+            virtual_raw = (row.get("virtual_number") or "").strip()
+            if not virtual_raw:
                 continue
 
-            tenant_id = (row.get("tenant_id") or "").strip() or virtual
-
+            tenant_id = (row.get("tenant_id") or "").strip() or virtual_raw
             tenant = {
                 "tenant_id": tenant_id,
                 "company_name": (row.get("company_name") or "").strip(),
                 "company_number": (row.get("company_number") or "").strip(),
-                "virtual_number": virtual,
+                "virtual_number": virtual_raw,
                 "retell_agent_id": (row.get("retell_agent_id") or "").strip(),
                 "plan": (row.get("plan") or "").strip(),
                 "opening_line": (row.get("opening_line") or "").strip(),
             }
 
-            TENANTS_BY_VIRTUAL[virtual] = tenant
+            TENANTS_BY_VIRTUAL[normalize_phone(virtual_raw)] = tenant
             TENANTS_BY_ID[tenant_id] = tenant
 
     log(f"✅ {len(TENANTS_BY_VIRTUAL)} tenants geladen")
@@ -116,7 +141,7 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
     if not receiver:
         return None
-    return TENANTS_BY_VIRTUAL.get(receiver.strip())
+    return TENANTS_BY_VIRTUAL.get(normalize_phone(receiver))
 
 
 # -----------------------------
@@ -132,6 +157,7 @@ def db_available() -> bool:
 
 def ensure_monthly_usage_table() -> None:
     if not db_available():
+        log("⚠️ DATABASE_URL ontbreekt")
         return
 
     try:
@@ -170,9 +196,9 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
                     """,
                     (month_key(), tenant_id, int(amount)),
                 )
+        log(f"✅ outbound+{amount} tenant={tenant_id} month={month_key()}")
     except pg_errors.UndefinedTable:
         ensure_monthly_usage_table()
-        # retry 1 keer
         try:
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
@@ -186,6 +212,7 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
                         """,
                         (month_key(), tenant_id, int(amount)),
                     )
+            log(f"✅ outbound+{amount} tenant={tenant_id} month={month_key()} (retry)")
         except Exception as e:
             log(f"⚠️ bump_monthly_outbound retry faalde: {e}")
     except Exception as e:
@@ -219,12 +246,11 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     }
 
     try:
-        r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=15)
+        r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=20)
         log(f"📤 Smstools send status={r.status_code}")
 
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"], 1)
-            log(f"✅ outbound+1 tenant={tenant['tenant_id']} month={month_key()}")
         else:
             log(f"⚠️ SMS send faalde body={r.text[:300]}")
     except Exception as e:
@@ -232,7 +258,7 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
 
 
 # -----------------------------
-# RETELL
+# RETELL (optioneel)
 # -----------------------------
 def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
     key = (tenant["tenant_id"], phone)
@@ -250,7 +276,7 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
                 "Content-Type": "application/json",
             },
             json={"agent_id": tenant["retell_agent_id"], "metadata": {"phone": phone}},
-            timeout=15,
+            timeout=20,
         )
         data = r.json() if r.content else {}
         chat_id = data.get("chat_id") or data.get("id")
@@ -281,7 +307,7 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
                 "Content-Type": "application/json",
             },
             json={"chat_id": chat_id, "content": text},
-            timeout=20,
+            timeout=25,
         )
         data = r.json() if r.content else {}
 
@@ -299,21 +325,6 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 # -----------------------------
 # HELPERS: webhook parsing
 # -----------------------------
-MISSED_CALL_TYPES = {
-    "missed_call",
-    "missedcall",
-    "call_missed",
-    "missed_call_event",
-    "call_event_missed",
-}
-
-INBOX_TYPES = {
-    "inbox_message",
-    "incoming_sms",
-    "sms_in",
-}
-
-
 def extract_event(payload: Any) -> Optional[Dict[str, Any]]:
     if payload is None:
         return None
@@ -359,46 +370,60 @@ def health():
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     """
-    Smstools webhook.
-    Verwacht dict of list.
+    SMSTOOLS webhook voor inkomende SMS.
     """
     data = request.get_json(force=True, silent=True)
     event = extract_event(data)
+
     if not event:
-        log("ℹ️ webhook: lege payload")
+        log("ℹ️ /sms/inbound: lege payload")
         return "OK", 200
 
-    webhook_type = (event.get("webhook_type") or event.get("type") or "").strip()
     receiver = extract_receiver(event)
+    sender = extract_sender(event)
+    text = extract_text(event)
 
-    log(f"📩 webhook_type={webhook_type} receiver={receiver}")
+    log(f"📩 /sms/inbound receiver={receiver} sender={sender} text_len={len(text)} keys={list(event.keys())[:12]}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
-        log(f"⚠️ Geen tenant gevonden voor receiver={receiver}")
+        log(f"⚠️ /sms/inbound: Geen tenant gevonden voor receiver={receiver}")
         return "OK", 200
 
-    # 1) Inkomende SMS → Retell → antwoord SMS
-    if webhook_type in INBOX_TYPES or webhook_type == "inbox_message":
-        sender = extract_sender(event)
-        text = extract_text(event)
-        log(f"💬 inbound sms from={sender} len={len(text)}")
-        if sender and text:
-            reply = ask_retell_via_sms(tenant, sender, text)
-            send_sms(tenant, sender, reply)
+    if sender and text:
+        reply = ask_retell_via_sms(tenant, sender, text)
+        send_sms(tenant, sender, reply)
+
+    return "OK", 200
+
+
+@app.route("/call/missed", methods=["POST"])
+def call_missed():
+    """
+    SMSTOOLS webhook voor missed calls / oproepdoorschakeling.
+    Stuurt altijd opening_line naar caller.
+    """
+    data = request.get_json(force=True, silent=True)
+    event = extract_event(data)
+
+    if not event:
+        log("ℹ️ /call/missed: lege payload")
         return "OK", 200
 
-    # 2) Missed call → stuur opening_line naar caller
-    if webhook_type in MISSED_CALL_TYPES:
-        caller = extract_calling_number(event)
-        log(f"📞 missed call caller={caller}")
-        if caller:
-            opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
-            send_sms(tenant, caller, opening)
+    receiver = extract_receiver(event)
+    caller = extract_calling_number(event)
+
+    log(f"📞 /call/missed receiver={receiver} caller={caller} keys={list(event.keys())[:12]}")
+
+    tenant = get_tenant_by_receiver(receiver)
+    if not tenant:
+        log(f"⚠️ /call/missed: Geen tenant gevonden voor receiver={receiver}")
         return "OK", 200
 
-    # 3) Andere events: loggen maar niets doen
-    log(f"ℹ️ Onbekend/ongebruikt webhook_type={webhook_type}")
+    if caller:
+        opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
+        send_sms(tenant, caller, opening)
+
     return "OK", 200
 
 
