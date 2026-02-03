@@ -33,20 +33,24 @@ DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 # -----------------------------
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 
+
 def log(msg: str) -> None:
     if DEBUG_LOGS:
         print(msg, flush=True)
 
+
 # -----------------------------
 # TENANTS (CSV)
 # -----------------------------
-TENANTS: Dict[str, Dict[str, Any]] = {}
-SMS_SESSIONS: Dict[Tuple[str, str], str] = {}  # (tenant_id, phone) -> chat_id
+# Keyed by virtual_number (receiver) because inbound webhook uses receiver to find tenant
+TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}
+# Also keyed by tenant_id for easy lookup when returning usage
+TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}
+
+# (tenant_id, phone) -> chat_id
+SMS_SESSIONS: Dict[Tuple[str, str], str] = {}
 
 
-# -----------------------------
-# LOG REQUESTS (optioneel)
-# -----------------------------
 @app.before_request
 def log_request():
     try:
@@ -56,41 +60,78 @@ def log_request():
 
 
 # -----------------------------
-# CSV LADEN
+# CSV HELPERS
 # -----------------------------
+def detect_delimiter(path: str) -> str:
+    """
+    Detects delimiter between ',' and ';' based on the header line.
+    Defaults to ';' if unclear.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            header = f.readline()
+        if header.count(",") > header.count(";"):
+            return ","
+        return ";"
+    except Exception:
+        return ";"
+
+
 def load_tenants_from_csv(path: str = "tenants.csv") -> None:
-    global TENANTS
-    TENANTS = {}
+    """
+    Supports both old and new header names.
+    New: tenant_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
+    Old: tenant_id,tenant_name,virtual_number,retell_agent_id,plan,opening_line (delimiter often ;)
+    """
+    global TENANTS_BY_VIRTUAL, TENANTS_BY_ID
+    TENANTS_BY_VIRTUAL = {}
+    TENANTS_BY_ID = {}
 
     if not os.path.exists(path):
         log("⚠️ tenants.csv niet gevonden")
         return
 
+    delimiter = detect_delimiter(path)
+
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter=";")
+        reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
+            # virtual_number is the key used by smstools inbound receiver
             virtual = (row.get("virtual_number") or "").strip()
             if not virtual:
                 continue
 
             tenant_id = (row.get("tenant_id") or "").strip() or virtual
-            tenant_name = (row.get("tenant_name") or "").strip() or tenant_id
 
-            TENANTS[virtual] = {
+            # allow both tenant_name and company_name
+            company_name = (row.get("company_name") or row.get("tenant_name") or "").strip() or tenant_id
+
+            # optional
+            company_number = (row.get("company_number") or "").strip()
+            plan = (row.get("plan") or "").strip()
+            retell_agent_id = (row.get("retell_agent_id") or "").strip()
+            opening_line = (row.get("opening_line") or "").strip()
+
+            tenant = {
                 "tenant_id": tenant_id,
-                "tenant_name": tenant_name,
+                "company_name": company_name,
+                "company_number": company_number,
+                "plan": plan,
                 "virtual_number": virtual,
-                "retell_agent_id": (row.get("retell_agent_id") or "").strip(),
-                "opening_line": (row.get("opening_line") or "").strip(),
+                "retell_agent_id": retell_agent_id,
+                "opening_line": opening_line,
             }
 
-    log(f"✅ {len(TENANTS)} tenants geladen")
+            TENANTS_BY_VIRTUAL[virtual] = tenant
+            TENANTS_BY_ID[tenant_id] = tenant
+
+    log(f"✅ {len(TENANTS_BY_VIRTUAL)} tenants geladen (delimiter='{delimiter}')")
 
 
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
     if not receiver:
         return None
-    return TENANTS.get(receiver.strip())
+    return TENANTS_BY_VIRTUAL.get(receiver.strip())
 
 
 # -----------------------------
@@ -105,10 +146,6 @@ def db_available() -> bool:
 
 
 def ensure_monthly_usage_table() -> None:
-    """
-    Zorgt dat monthly_usage bestaat.
-    We callen dit op startup + als fallback.
-    """
     if not db_available():
         return
 
@@ -128,14 +165,10 @@ def ensure_monthly_usage_table() -> None:
                 )
         log("✅ DB table monthly_usage is aanwezig")
     except Exception as e:
-        # Niet hard crashen, endpoint kan nog werken zonder DB
         log(f"⚠️ Kon monthly_usage table niet verzekeren: {e}")
 
 
 def bump_monthly_outbound(tenant_id: str) -> None:
-    """
-    Telt 1 outbound SMS bij voor de tenant in de huidige maand.
-    """
     if not db_available():
         return
 
@@ -153,7 +186,6 @@ def bump_monthly_outbound(tenant_id: str) -> None:
                     (month_key(), tenant_id),
                 )
     except pg_errors.UndefinedTable:
-        # Tabel bestaat niet (nog) → maak aan en probeer opnieuw
         ensure_monthly_usage_table()
         try:
             with psycopg2.connect(DATABASE_URL) as conn:
@@ -191,7 +223,7 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     payload = {
         "message": message,
         "to": to_number,
-        "sender": tenant["virtual_number"],  # belangrijk: juiste virtual number
+        "sender": tenant["virtual_number"],  # juiste virtual number
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
@@ -201,7 +233,6 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
 
     try:
         r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=15)
-        # Als je enkel succesvolle sends wil tellen:
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"])
         else:
@@ -267,7 +298,6 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
         )
         data = r.json() if r.content else {}
 
-        # Retell kan messages teruggeven; we pakken de laatste agent reply
         for m in reversed(data.get("messages", [])):
             if m.get("role") == "agent":
                 content = (m.get("content") or "").strip()
@@ -292,7 +322,6 @@ def sms_inbound():
     """
     Smstools webhook.
     We verwachten dict of list.
-    We antwoorden altijd snel OK.
     """
     data = request.get_json(force=True, silent=True)
     if not data:
@@ -310,7 +339,6 @@ def sms_inbound():
     if not tenant:
         return "OK", 200
 
-    # Enkel inkomende berichten beantwoorden
     if webhook_type == "inbox_message":
         sender = (msg.get("sender") or "").strip()
         text = (msg.get("content") or "").strip()
@@ -328,13 +356,12 @@ def sms_inbound():
 @app.route("/admin/usage", methods=["GET"])
 def admin_usage():
     """
-    Geeft alle maand-tenant outbound counts terug voor Google Sheets.
+    Geeft maandelijkse outbound counts + tenant info terug.
     """
     if not db_available():
         return jsonify({"data": []}), 200
 
     try:
-        # Zorg dat table bestaat (safe)
         ensure_monthly_usage_table()
 
         with psycopg2.connect(DATABASE_URL) as conn:
@@ -348,17 +375,23 @@ def admin_usage():
                 )
                 rows = cur.fetchall()
 
-        return jsonify(
-            {
-                "data": [
-                    {"month": m, "tenant_id": t, "outbound_count": c}
-                    for (m, t, c) in rows
-                ]
-            }
-        ), 200
+        data = []
+        for (m, tenant_id, c) in rows:
+            t = TENANTS_BY_ID.get(tenant_id, {})
+            data.append(
+                {
+                    "month": m,
+                    "tenant_id": tenant_id,
+                    "company_name": t.get("company_name", ""),
+                    "company_number": t.get("company_number", ""),
+                    "plan": t.get("plan", ""),
+                    "outbound_count": c,
+                }
+            )
+
+        return jsonify({"data": data}), 200
 
     except pg_errors.InvalidCatalogName as e:
-        # Dit is precies jouw error als database naam fout/whitespace is
         log(f"❌ DB bestaat niet (InvalidCatalogName): {e}")
         return jsonify({"error": "database does not exist", "data": []}), 500
 
@@ -374,5 +407,5 @@ load_tenants_from_csv()
 ensure_monthly_usage_table()
 
 if __name__ == "__main__":
-    # Render gebruikt gunicorn, lokaal kan dit handig zijn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+
