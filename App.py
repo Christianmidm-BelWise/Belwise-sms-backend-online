@@ -29,7 +29,7 @@ RETELL_BASE_URL = "https://api.retellai.com"
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 
 # -----------------------------
-# OPTIONAL ADMIN TOKEN (voor test endpoints)
+# OPTIONAL ADMIN TOKEN
 # -----------------------------
 ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN") or "").strip()
 
@@ -61,13 +61,9 @@ def log_request():
 
 
 def detect_csv_delimiter(path: str) -> str:
-    """
-    Detecteert ; of , op basis van de headerregel.
-    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             header = f.readline()
-        # simpele detectie
         if header.count(";") >= header.count(","):
             return ";"
         return ","
@@ -77,10 +73,9 @@ def detect_csv_delimiter(path: str) -> str:
 
 def load_tenants_from_csv(path: str = "tenants.csv") -> None:
     """
-    Verwachte kolommen (jouw structuur):
+    Verwachte kolommen:
     tenant_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
-
-    (Delimiter ; of , mag allebei)
+    (delimiter ; of ,)
     """
     global TENANTS_BY_VIRTUAL, TENANTS_BY_ID
     TENANTS_BY_VIRTUAL = {}
@@ -136,9 +131,6 @@ def db_available() -> bool:
 
 
 def ensure_monthly_usage_table() -> None:
-    """
-    Zorgt dat monthly_usage bestaat.
-    """
     if not db_available():
         return
 
@@ -162,9 +154,6 @@ def ensure_monthly_usage_table() -> None:
 
 
 def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
-    """
-    Telt outbound SMS bij voor tenant in huidige maand.
-    """
     if not db_available():
         return
 
@@ -183,6 +172,7 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
                 )
     except pg_errors.UndefinedTable:
         ensure_monthly_usage_table()
+        # retry 1 keer
         try:
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
@@ -207,9 +197,10 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
 # -----------------------------
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     """
-    Stuurt via smstools en telt dan outbound (1 per SMS).
+    Stuurt via smstools en telt outbound (1 per bericht) bij op success.
     """
     if not to_number or not message:
+        log("⚠️ send_sms: ontbrekende to_number of message")
         return
 
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
@@ -229,10 +220,13 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
 
     try:
         r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=15)
+        log(f"📤 Smstools send status={r.status_code}")
+
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"], 1)
+            log(f"✅ outbound+1 tenant={tenant['tenant_id']} month={month_key()}")
         else:
-            log(f"⚠️ SMS send faalde status={r.status_code} body={r.text[:300]}")
+            log(f"⚠️ SMS send faalde body={r.text[:300]}")
     except Exception as e:
         log(f"⚠️ SMS send error: {e}")
 
@@ -303,6 +297,58 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 
 
 # -----------------------------
+# HELPERS: webhook parsing
+# -----------------------------
+MISSED_CALL_TYPES = {
+    "missed_call",
+    "missedcall",
+    "call_missed",
+    "missed_call_event",
+    "call_event_missed",
+}
+
+INBOX_TYPES = {
+    "inbox_message",
+    "incoming_sms",
+    "sms_in",
+}
+
+
+def extract_event(payload: Any) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    if isinstance(payload, list):
+        return payload[0] if payload else None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def extract_receiver(event: Dict[str, Any]) -> str:
+    msg = event.get("message") or {}
+    return (msg.get("receiver") or event.get("receiver") or "").strip()
+
+
+def extract_sender(event: Dict[str, Any]) -> str:
+    msg = event.get("message") or {}
+    return (msg.get("sender") or event.get("sender") or event.get("from") or "").strip()
+
+
+def extract_text(event: Dict[str, Any]) -> str:
+    msg = event.get("message") or {}
+    return (msg.get("content") or event.get("content") or event.get("text") or "").strip()
+
+
+def extract_calling_number(event: Dict[str, Any]) -> str:
+    # varieert per provider
+    return (
+        (event.get("caller") or "")
+        or (event.get("from") or "")
+        or extract_sender(event)
+    ).strip()
+
+
+# -----------------------------
 # ROUTES
 # -----------------------------
 @app.route("/", methods=["GET"])
@@ -317,31 +363,42 @@ def sms_inbound():
     Verwacht dict of list.
     """
     data = request.get_json(force=True, silent=True)
-    if not data:
+    event = extract_event(data)
+    if not event:
+        log("ℹ️ webhook: lege payload")
         return "OK", 200
 
-    event = data[0] if isinstance(data, list) and data else data
-    if not isinstance(event, dict):
-        return "OK", 200
+    webhook_type = (event.get("webhook_type") or event.get("type") or "").strip()
+    receiver = extract_receiver(event)
 
-    webhook_type = event.get("webhook_type")
-    msg = event.get("message") or {}
-    receiver = (msg.get("receiver") or "").strip()
+    log(f"📩 webhook_type={webhook_type} receiver={receiver}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
         log(f"⚠️ Geen tenant gevonden voor receiver={receiver}")
         return "OK", 200
 
-    # Enkel inkomende berichten beantwoorden
-    if webhook_type == "inbox_message":
-        sender = (msg.get("sender") or "").strip()
-        text = (msg.get("content") or "").strip()
-
+    # 1) Inkomende SMS → Retell → antwoord SMS
+    if webhook_type in INBOX_TYPES or webhook_type == "inbox_message":
+        sender = extract_sender(event)
+        text = extract_text(event)
+        log(f"💬 inbound sms from={sender} len={len(text)}")
         if sender and text:
             reply = ask_retell_via_sms(tenant, sender, text)
             send_sms(tenant, sender, reply)
+        return "OK", 200
 
+    # 2) Missed call → stuur opening_line naar caller
+    if webhook_type in MISSED_CALL_TYPES:
+        caller = extract_calling_number(event)
+        log(f"📞 missed call caller={caller}")
+        if caller:
+            opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
+            send_sms(tenant, caller, opening)
+        return "OK", 200
+
+    # 3) Andere events: loggen maar niets doen
+    log(f"ℹ️ Onbekend/ongebruikt webhook_type={webhook_type}")
     return "OK", 200
 
 
@@ -351,7 +408,7 @@ def sms_inbound():
 @app.route("/admin/usage", methods=["GET"])
 def admin_usage():
     """
-    Geeft rows terug voor Google Sheets in de volgorde:
+    Volgorde voor Sheets:
     Month, Company Number, Company Name, Tenant ID, Plan, Outbound
     """
     if not db_available():
@@ -371,10 +428,10 @@ def admin_usage():
                 )
                 rows = cur.fetchall()
 
-        data = []
+        data_out = []
         for (m, tenant_id, outbound) in rows:
             t = TENANTS_BY_ID.get(tenant_id, {})
-            data.append(
+            data_out.append(
                 {
                     "month": m,
                     "company_number": t.get("company_number", ""),
@@ -385,18 +442,15 @@ def admin_usage():
                 }
             )
 
-        return jsonify({"data": data}), 200
+        return jsonify({"data": data_out}), 200
 
-    except pg_errors.InvalidCatalogName as e:
-        log(f"❌ DB bestaat niet (InvalidCatalogName): {e}")
-        return jsonify({"error": "database does not exist", "data": []}), 500
     except Exception as e:
         log(f"❌ admin_usage error: {e}")
         return jsonify({"error": "internal_error", "data": []}), 500
 
 
 # -----------------------------
-# ADMIN TEST — MANUEEL TELLEN (optioneel)
+# ADMIN TEST — MANUEEL TELLEN
 # -----------------------------
 @app.route("/admin/bump", methods=["POST"])
 def admin_bump():
