@@ -1,42 +1,39 @@
-from flask import Flask, request, jsonify
 import os
-import csv
-from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
 import re
+import csv
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 import psycopg2
 from psycopg2 import errors as pg_errors
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# -----------------------------
-# ENV VARS - SMSTOOLS
-# -----------------------------
-SMSTOOLS_CLIENT_ID = os.environ.get("SMSTOOLS_CLIENT_ID")
-SMSTOOLS_CLIENT_SECRET = os.environ.get("SMSTOOLS_CLIENT_SECRET")
+# ============================================================
+# CONFIG
+# ============================================================
+
+# ---- SMSTOOLS ----
+SMSTOOLS_CLIENT_ID = (os.environ.get("SMSTOOLS_CLIENT_ID") or "").strip()
+SMSTOOLS_CLIENT_SECRET = (os.environ.get("SMSTOOLS_CLIENT_SECRET") or "").strip()
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
-# -----------------------------
-# ENV VARS - RETELL (optioneel)
-# -----------------------------
-RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
+# ---- RETELL (optioneel) ----
+RETELL_API_KEY = (os.environ.get("RETELL_API_KEY") or "").strip()
 RETELL_BASE_URL = "https://api.retellai.com"
 
-# -----------------------------
-# ENV VARS - DATABASE
-# -----------------------------
+# ---- DB ----
 RAW_DATABASE_URL = os.environ.get("DATABASE_URL") or ""
 
-# -----------------------------
-# OPTIONAL ADMIN TOKEN
-# -----------------------------
+# ---- ADMIN ----
 ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN") or "").strip()
 
-# -----------------------------
-# DEBUG LOGGING
-# -----------------------------
+# ---- CSV PATH ----
+TENANTS_CSV_PATH = os.environ.get("TENANTS_CSV_PATH") or "tenants.csv"
+
+# ---- LOGGING ----
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 
 
@@ -46,12 +43,16 @@ def log(msg: str) -> None:
 
 
 @app.before_request
-def log_request():
+def _log_request() -> None:
     try:
         log(f"➡️ {request.method} {request.path}")
     except Exception:
         pass
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def sanitize_database_url(raw: str) -> str:
     """
@@ -62,57 +63,93 @@ def sanitize_database_url(raw: str) -> str:
     if not raw:
         return ""
     m = re.search(r"(postgres(?:ql)?://\S+)", raw)
-    if m:
-        return m.group(1).strip()
-    return raw.strip()
+    return (m.group(1).strip() if m else raw.strip())
 
 
 DATABASE_URL = sanitize_database_url(RAW_DATABASE_URL)
 
-# -----------------------------
-# TENANTS (CSV)
-# -----------------------------
-TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}  # normalized virtual_number -> tenant dict
-TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}       # tenant_id -> tenant dict
-SMS_SESSIONS: Dict[Tuple[str, str], str] = {}       # (tenant_id, phone) -> chat_id
+
+def db_available() -> bool:
+    return bool(DATABASE_URL)
 
 
-def normalize_phone(s: str) -> str:
+def month_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def normalize_phone(raw: str) -> str:
     """
-    Make phone comparisons robust:
+    Normalize phone numbers to digits only and try to make BE format consistent:
     - keep digits only
+    - convert 0032xxxxxxxxx -> 32xxxxxxxxx
+    - convert 0xxxxxxxxx (BE) -> 32xxxxxxxxx (when length suggests BE mobile/landline)
     """
-    s = (s or "").strip()
-    return re.sub(r"\D+", "", s)
+    s = re.sub(r"\D+", "", (raw or "").strip())
+
+    if s.startswith("0032"):
+        s = "32" + s[4:]
+
+    # If number looks like Belgian national format starting with 0
+    # Common lengths: 9 or 10 digits after leading 0 (e.g. 0470..., 02..., 03...)
+    if s.startswith("0") and len(s) in (9, 10):
+        s = "32" + s[1:]
+
+    return s
 
 
 def detect_csv_delimiter(path: str) -> str:
+    """
+    Simple delimiter detection: if header contains more ';' than ',', treat as ';'
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             header = f.readline()
-        if header.count(";") >= header.count(","):
-            return ";"
-        return ","
+        return ";" if header.count(";") >= header.count(",") else ","
     except Exception:
         return ";"
 
 
-def load_tenants_from_csv(path: str = "tenants.csv") -> None:
+def require_admin_token() -> Optional[Any]:
     """
-    Verwachte kolommen:
-    tenant_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
-    (delimiter ; of ,)
+    If ADMIN_TOKEN is set, require ?token=... for admin endpoints.
+    """
+    if not ADMIN_TOKEN:
+        return None
+    token = (request.args.get("token") or "").strip()
+    if token != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
+# ============================================================
+# TENANTS (CSV)
+# ============================================================
+
+TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}  # normalized virtual_number -> tenant dict
+TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}       # tenant_id -> tenant dict
+
+# Simple in-memory chat session mapping for Retell:
+SMS_SESSIONS: Dict[Tuple[str, str], str] = {}       # (tenant_id, phone) -> chat_id
+
+
+def load_tenants_from_csv(path: str) -> None:
+    """
+    Expected columns (preferred):
+    tenant_id,stripe_customer_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
+
+    - delimiter can be ',' or ';'
+    - stripe_customer_id can be blank
     """
     global TENANTS_BY_VIRTUAL, TENANTS_BY_ID
     TENANTS_BY_VIRTUAL = {}
     TENANTS_BY_ID = {}
 
     if not os.path.exists(path):
-        log("⚠️ tenants.csv niet gevonden")
+        log(f"⚠️ tenants.csv not found at: {path}")
         return
 
     delimiter = detect_csv_delimiter(path)
-    log(f"ℹ️ tenants.csv delimiter = '{delimiter}'")
+    log(f"ℹ️ tenants.csv delimiter detected: '{delimiter}' ({path})")
 
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=delimiter)
@@ -122,8 +159,11 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
                 continue
 
             tenant_id = (row.get("tenant_id") or "").strip() or virtual_raw
+            stripe_customer_id = (row.get("stripe_customer_id") or "").strip()
+
             tenant = {
                 "tenant_id": tenant_id,
+                "stripe_customer_id": stripe_customer_id,  # <-- NEW
                 "company_name": (row.get("company_name") or "").strip(),
                 "company_number": (row.get("company_number") or "").strip(),
                 "virtual_number": virtual_raw,
@@ -135,7 +175,7 @@ def load_tenants_from_csv(path: str = "tenants.csv") -> None:
             TENANTS_BY_VIRTUAL[normalize_phone(virtual_raw)] = tenant
             TENANTS_BY_ID[tenant_id] = tenant
 
-    log(f"✅ {len(TENANTS_BY_VIRTUAL)} tenants geladen")
+    log(f"✅ Loaded tenants: {len(TENANTS_BY_VIRTUAL)}")
 
 
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
@@ -144,20 +184,13 @@ def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
     return TENANTS_BY_VIRTUAL.get(normalize_phone(receiver))
 
 
-# -----------------------------
-# DB HELPERS
-# -----------------------------
-def month_key() -> str:
-    return datetime.utcnow().strftime("%Y-%m")
-
-
-def db_available() -> bool:
-    return bool(DATABASE_URL)
-
+# ============================================================
+# DB (monthly_usage)
+# ============================================================
 
 def ensure_monthly_usage_table() -> None:
     if not db_available():
-        log("⚠️ DATABASE_URL ontbreekt")
+        log("⚠️ DATABASE_URL missing; usage tracking disabled")
         return
 
     try:
@@ -174,9 +207,9 @@ def ensure_monthly_usage_table() -> None:
                     );
                     """
                 )
-        log("✅ DB table monthly_usage is aanwezig")
+        log("✅ monthly_usage table ensured")
     except Exception as e:
-        log(f"⚠️ Kon monthly_usage table niet verzekeren: {e}")
+        log(f"⚠️ ensure_monthly_usage_table failed: {e}")
 
 
 def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
@@ -214,30 +247,31 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
                     )
             log(f"✅ outbound+{amount} tenant={tenant_id} month={month_key()} (retry)")
         except Exception as e:
-            log(f"⚠️ bump_monthly_outbound retry faalde: {e}")
+            log(f"⚠️ bump_monthly_outbound retry failed: {e}")
     except Exception as e:
-        log(f"⚠️ bump_monthly_outbound error: {e}")
+        log(f"⚠️ bump_monthly_outbound failed: {e}")
 
 
-# -----------------------------
-# SMS VERSTUREN
-# -----------------------------
+# ============================================================
+# SMS SEND (Smstools)
+# ============================================================
+
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     """
-    Stuurt via smstools en telt outbound (1 per bericht) bij op success.
+    Sends SMS via Smstools and increments outbound_count by 1 on success.
     """
     if not to_number or not message:
-        log("⚠️ send_sms: ontbrekende to_number of message")
+        log("⚠️ send_sms: missing to_number/message")
         return
 
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
-        log("⚠️ SMSTOOLS_CLIENT_ID/SECRET ontbreken")
+        log("⚠️ Smstools credentials missing")
         return
 
     payload = {
         "message": message,
         "to": to_number,
-        "sender": tenant["virtual_number"],
+        "sender": tenant["virtual_number"],  # keep original tenant number
     }
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
@@ -252,14 +286,15 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"], 1)
         else:
-            log(f"⚠️ SMS send faalde body={r.text[:300]}")
+            log(f"⚠️ Smstools send failed: {r.text[:300]}")
     except Exception as e:
-        log(f"⚠️ SMS send error: {e}")
+        log(f"⚠️ Smstools send error: {e}")
 
 
-# -----------------------------
-# RETELL (optioneel)
-# -----------------------------
+# ============================================================
+# RETELL (optional)
+# ============================================================
+
 def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
     key = (tenant["tenant_id"], phone)
     if key in SMS_SESSIONS:
@@ -292,6 +327,7 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
 def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
     opening = tenant.get("opening_line") or "Bedankt voor je bericht."
 
+    # If Retell isn't configured, just return opening line
     if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
         return opening
 
@@ -311,20 +347,21 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
         )
         data = r.json() if r.content else {}
 
+        # Find latest agent message
         for m in reversed(data.get("messages", [])):
             if m.get("role") == "agent":
                 content = (m.get("content") or "").strip()
                 return content or opening
-
     except Exception as e:
         log(f"⚠️ Retell completion error: {e}")
 
     return opening
 
 
-# -----------------------------
-# HELPERS: webhook parsing
-# -----------------------------
+# ============================================================
+# WEBHOOK PARSING
+# ============================================================
+
 def extract_event(payload: Any) -> Optional[Dict[str, Any]]:
     if payload is None:
         return None
@@ -351,7 +388,6 @@ def extract_text(event: Dict[str, Any]) -> str:
 
 
 def extract_calling_number(event: Dict[str, Any]) -> str:
-    # varieert per provider
     return (
         (event.get("caller") or "")
         or (event.get("from") or "")
@@ -359,35 +395,35 @@ def extract_calling_number(event: Dict[str, Any]) -> str:
     ).strip()
 
 
-# -----------------------------
+# ============================================================
 # ROUTES
-# -----------------------------
+# ============================================================
+
 @app.route("/", methods=["GET"])
-def health():
+def health() -> Tuple[str, int]:
     return "OK", 200
 
 
 @app.route("/sms/inbound", methods=["POST"])
-def sms_inbound():
+def sms_inbound() -> Tuple[str, int]:
     """
-    SMSTOOLS webhook voor inkomende SMS.
+    Smstools webhook for inbound SMS.
     """
-    data = request.get_json(force=True, silent=True)
-    event = extract_event(data)
-
+    payload = request.get_json(force=True, silent=True)
+    event = extract_event(payload)
     if not event:
-        log("ℹ️ /sms/inbound: lege payload")
+        log("ℹ️ /sms/inbound: empty payload")
         return "OK", 200
 
     receiver = extract_receiver(event)
     sender = extract_sender(event)
     text = extract_text(event)
 
-    log(f"📩 /sms/inbound receiver={receiver} sender={sender} text_len={len(text)} keys={list(event.keys())[:12]}")
+    log(f"📩 /sms/inbound receiver={receiver} sender={sender} text_len={len(text)}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
-        log(f"⚠️ /sms/inbound: Geen tenant gevonden voor receiver={receiver}")
+        log(f"⚠️ /sms/inbound: no tenant found for receiver={receiver} norm={normalize_phone(receiver)}")
         return "OK", 200
 
     if sender and text:
@@ -398,26 +434,25 @@ def sms_inbound():
 
 
 @app.route("/call/missed", methods=["POST"])
-def call_missed():
+def call_missed() -> Tuple[str, int]:
     """
-    SMSTOOLS webhook voor missed calls / oproepdoorschakeling.
-    Stuurt altijd opening_line naar caller.
+    Smstools webhook for missed calls.
+    Always sends opening_line to caller.
     """
-    data = request.get_json(force=True, silent=True)
-    event = extract_event(data)
-
+    payload = request.get_json(force=True, silent=True)
+    event = extract_event(payload)
     if not event:
-        log("ℹ️ /call/missed: lege payload")
+        log("ℹ️ /call/missed: empty payload")
         return "OK", 200
 
     receiver = extract_receiver(event)
     caller = extract_calling_number(event)
 
-    log(f"📞 /call/missed receiver={receiver} caller={caller} keys={list(event.keys())[:12]}")
+    log(f"📞 /call/missed receiver={receiver} caller={caller}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
-        log(f"⚠️ /call/missed: Geen tenant gevonden voor receiver={receiver}")
+        log(f"⚠️ /call/missed: no tenant found for receiver={receiver} norm={normalize_phone(receiver)}")
         return "OK", 200
 
     if caller:
@@ -427,15 +462,19 @@ def call_missed():
     return "OK", 200
 
 
-# -----------------------------
-# ADMIN API — USAGE (voor Google Sheets)
-# -----------------------------
+# ============================================================
+# ADMIN API (usage for Google Sheets)
+# ============================================================
+
 @app.route("/admin/usage", methods=["GET"])
 def admin_usage():
     """
-    Volgorde voor Sheets:
-    Month, Company Number, Company Name, Tenant ID, Plan, Outbound
+    Returns usage for Sheets.
     """
+    auth = require_admin_token()
+    if auth is not None:
+        return auth
+
     if not db_available():
         return jsonify({"data": []}), 200
 
@@ -453,40 +492,38 @@ def admin_usage():
                 )
                 rows = cur.fetchall()
 
-        data_out = []
+        out = []
         for (m, tenant_id, outbound) in rows:
             t = TENANTS_BY_ID.get(tenant_id, {})
-            data_out.append(
+            out.append(
                 {
                     "month": m,
                     "company_number": t.get("company_number", ""),
                     "company_name": t.get("company_name", ""),
                     "tenant_id": tenant_id,
+                    "stripe_customer_id": t.get("stripe_customer_id", ""),  # <-- NEW
                     "plan": t.get("plan", ""),
                     "outbound": int(outbound or 0),
                 }
             )
 
-        return jsonify({"data": data_out}), 200
+        return jsonify({"data": out}), 200
 
     except Exception as e:
-        log(f"❌ admin_usage error: {e}")
+        log(f"❌ /admin/usage error: {e}")
         return jsonify({"error": "internal_error", "data": []}), 500
 
 
-# -----------------------------
-# ADMIN TEST — MANUEEL TELLEN
-# -----------------------------
 @app.route("/admin/bump", methods=["POST"])
 def admin_bump():
     """
+    Manual bump (debug/test):
     POST /admin/bump?token=...
     body: {"tenant_id": "...", "amount": 1}
     """
-    if ADMIN_TOKEN:
-        token = (request.args.get("token") or "").strip()
-        if token != ADMIN_TOKEN:
-            return jsonify({"error": "unauthorized"}), 401
+    auth = require_admin_token()
+    if auth is not None:
+        return auth
 
     payload = request.get_json(force=True, silent=True) or {}
     tenant_id = (payload.get("tenant_id") or "").strip()
@@ -499,11 +536,28 @@ def admin_bump():
     return jsonify({"ok": True}), 200
 
 
-# -----------------------------
+@app.route("/admin/reload-tenants", methods=["POST"])
+def admin_reload_tenants():
+    """
+    Reload tenants.csv without redeploy.
+    POST /admin/reload-tenants?token=...
+    """
+    auth = require_admin_token()
+    if auth is not None:
+        return auth
+
+    load_tenants_from_csv(TENANTS_CSV_PATH)
+    return jsonify({"ok": True, "tenants": len(TENANTS_BY_ID)}), 200
+
+
+# ============================================================
 # STARTUP
-# -----------------------------
-load_tenants_from_csv()
+# ============================================================
+
+load_tenants_from_csv(TENANTS_CSV_PATH)
 ensure_monthly_usage_table()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
+
