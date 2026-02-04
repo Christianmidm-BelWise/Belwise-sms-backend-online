@@ -11,34 +11,35 @@ from flask import Flask, request, jsonify
 
 import stripe  # pip install stripe
 
+
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG
+# ENV / CONFIG
 # ============================================================
 
-# ---- SMSTOOLS ----
+# Smstools
 SMSTOOLS_CLIENT_ID = (os.environ.get("SMSTOOLS_CLIENT_ID") or "").strip()
 SMSTOOLS_CLIENT_SECRET = (os.environ.get("SMSTOOLS_CLIENT_SECRET") or "").strip()
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
-# ---- RETELL (optional) ----
+# Retell (optional)
 RETELL_API_KEY = (os.environ.get("RETELL_API_KEY") or "").strip()
 RETELL_BASE_URL = "https://api.retellai.com"
 
-# ---- STRIPE ----
+# Stripe
 STRIPE_SECRET_KEY = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
 
-# ---- DB ----
+# DB
 RAW_DATABASE_URL = os.environ.get("DATABASE_URL") or ""
 
-# ---- ADMIN ----
+# Admin
 ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN") or "").strip()
 
-# ---- CSV PATH ----
+# CSV
 TENANTS_CSV_PATH = os.environ.get("TENANTS_CSV_PATH") or "tenants.csv"
 
-# ---- LOGGING ----
+# Logs
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 
 
@@ -55,15 +56,7 @@ def _log_request() -> None:
         pass
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def sanitize_database_url(raw: str) -> str:
-    """
-    - trims whitespace/newlines
-    - if multiple URLs accidentally pasted, pick the first postgresql://... token
-    """
     raw = (raw or "").strip()
     if not raw:
         return ""
@@ -76,6 +69,20 @@ DATABASE_URL = sanitize_database_url(RAW_DATABASE_URL)
 
 def db_available() -> bool:
     return bool(DATABASE_URL)
+
+
+def stripe_ready() -> bool:
+    return bool(STRIPE_SECRET_KEY)
+
+
+def require_admin_token() -> Optional[Any]:
+    # If ADMIN_TOKEN is empty -> no auth required (not recommended for prod)
+    if not ADMIN_TOKEN:
+        return None
+    token = (request.args.get("token") or "").strip()
+    if token != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
 
 
 def month_key(dt: Optional[datetime] = None) -> str:
@@ -94,28 +101,15 @@ def previous_month_key() -> str:
 
 
 def normalize_phone(raw: str) -> str:
-    """
-    Normalize phone numbers to digits only and try to make BE format consistent:
-    - keep digits only
-    - convert 0032xxxxxxxxx -> 32xxxxxxxxx
-    - convert 0xxxxxxxxx (BE) -> 32xxxxxxxxx (when length suggests BE mobile/landline)
-    """
     s = re.sub(r"\D+", "", (raw or "").strip())
-
     if s.startswith("0032"):
         s = "32" + s[4:]
-
-    # If number looks like Belgian national format starting with 0
     if s.startswith("0") and len(s) in (9, 10):
         s = "32" + s[1:]
-
     return s
 
 
 def detect_csv_delimiter(path: str) -> str:
-    """
-    Simple delimiter detection: if header contains more ';' than ',', treat as ';'
-    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             header = f.readline()
@@ -124,88 +118,93 @@ def detect_csv_delimiter(path: str) -> str:
         return ";"
 
 
-def require_admin_token() -> Optional[Any]:
-    """
-    If ADMIN_TOKEN is set, require ?token=... for admin endpoints.
-    """
-    if not ADMIN_TOKEN:
-        return None
-    token = (request.args.get("token") or "").strip()
-    if token != ADMIN_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-    return None
+def to_int_safe(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        s = str(value).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
 
 # ============================================================
 # TENANTS (CSV)
+# Your CSV columns:
+# tenant_id, stripe_customer_id, company_name, company_number,
+# virtual_number, retell_agent_id, plan, price_cents, opening_line
 # ============================================================
 
-TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}  # normalized virtual_number -> tenant dict
-TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}       # tenant_id -> tenant dict
+TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}
+TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}
 
-# Simple in-memory chat session mapping for Retell:
-SMS_SESSIONS: Dict[Tuple[str, str], str] = {}       # (tenant_id, phone) -> chat_id
+# (tenant_id, phone) -> chat_id
+SMS_SESSIONS: Dict[Tuple[str, str], str] = {}
 
 
 def load_tenants_from_csv(path: str) -> None:
-    """
-    Expected columns:
-    tenant_id,stripe_customer_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
-    delimiter can be ',' or ';'
-    """
     global TENANTS_BY_VIRTUAL, TENANTS_BY_ID
     TENANTS_BY_VIRTUAL = {}
     TENANTS_BY_ID = {}
 
     if not os.path.exists(path):
-        log(f"⚠️ tenants.csv not found at: {path}")
+        log(f"⚠️ tenants.csv not found at {path}")
         return
 
     delimiter = detect_csv_delimiter(path)
-    log(f"ℹ️ tenants.csv delimiter detected: '{delimiter}' ({path})")
+    log(f"ℹ️ tenants.csv delimiter='{delimiter}' path={path}")
 
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
+            tenant_id = (row.get("tenant_id") or "").strip()
             virtual_raw = (row.get("virtual_number") or "").strip()
-            if not virtual_raw:
+            if not tenant_id or not virtual_raw:
                 continue
-
-            tenant_id = (row.get("tenant_id") or "").strip() or virtual_raw
-            stripe_customer_id = (row.get("stripe_customer_id") or "").strip()
 
             tenant = {
                 "tenant_id": tenant_id,
-                "stripe_customer_id": stripe_customer_id,
+                "stripe_customer_id": (row.get("stripe_customer_id") or "").strip(),
                 "company_name": (row.get("company_name") or "").strip(),
                 "company_number": (row.get("company_number") or "").strip(),
                 "virtual_number": virtual_raw,
                 "retell_agent_id": (row.get("retell_agent_id") or "").strip(),
-                "plan": (row.get("plan") or "").strip(),
+                "plan": (row.get("plan") or "").strip().lower(),
+                "price_cents": to_int_safe(row.get("price_cents"), 0),
                 "opening_line": (row.get("opening_line") or "").strip(),
             }
 
             TENANTS_BY_VIRTUAL[normalize_phone(virtual_raw)] = tenant
             TENANTS_BY_ID[tenant_id] = tenant
 
-    log(f"✅ Loaded tenants: {len(TENANTS_BY_VIRTUAL)}")
+    log(f"✅ Loaded tenants: {len(TENANTS_BY_ID)}")
 
 
 def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
-    if not receiver:
-        return None
-    return TENANTS_BY_VIRTUAL.get(normalize_phone(receiver))
+    return TENANTS_BY_VIRTUAL.get(normalize_phone(receiver or ""))
+
+
+def get_overage_price_cents(tenant: Dict[str, Any]) -> int:
+    # Primary: CSV column
+    pc = to_int_safe(tenant.get("price_cents"), 0)
+    if pc > 0:
+        return pc
+
+    # Fallbacks (should rarely happen if CSV is correct)
+    plan = (tenant.get("plan") or "").strip().lower()
+    return 17 if plan == "advanced" else 19
 
 
 # ============================================================
-# DB (monthly_usage)
+# DB: monthly_usage
 # ============================================================
 
 def ensure_monthly_usage_table() -> None:
     if not db_available():
         log("⚠️ DATABASE_URL missing; usage tracking disabled")
         return
-
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -220,7 +219,7 @@ def ensure_monthly_usage_table() -> None:
                     );
                     """
                 )
-        log("✅ monthly_usage table ensured")
+        log("✅ monthly_usage ensured")
     except Exception as e:
         log(f"⚠️ ensure_monthly_usage_table failed: {e}")
 
@@ -228,7 +227,6 @@ def ensure_monthly_usage_table() -> None:
 def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
     if not db_available():
         return
-
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -245,33 +243,15 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
         log(f"✅ outbound+{amount} tenant={tenant_id} month={month_key()}")
     except pg_errors.UndefinedTable:
         ensure_monthly_usage_table()
-        try:
-            with psycopg2.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO monthly_usage (month, tenant_id, outbound_count)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (month, tenant_id)
-                        DO UPDATE SET outbound_count = monthly_usage.outbound_count + EXCLUDED.outbound_count,
-                                      updated_at = NOW();
-                        """,
-                        (month_key(), tenant_id, int(amount)),
-                    )
-        except Exception as e:
-            log(f"⚠️ bump_monthly_outbound retry failed: {e}")
+        bump_monthly_outbound(tenant_id, amount)
     except Exception as e:
         log(f"⚠️ bump_monthly_outbound failed: {e}")
 
 
 def fetch_month_usage(month: str) -> List[Tuple[str, int]]:
-    """
-    Returns list of (tenant_id, outbound_count) for a given month.
-    """
     if not db_available():
         return []
     ensure_monthly_usage_table()
-
     with psycopg2.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -287,16 +267,13 @@ def fetch_month_usage(month: str) -> List[Tuple[str, int]]:
 
 
 # ============================================================
-# STRIPE OVERAGES (invoice items)
+# STRIPE: prevent double-billing
 # ============================================================
 
 PLAN_LIMITS = {"basic": 200, "advanced": 400}
 
 
 def ensure_overage_runs_table() -> None:
-    """
-    Prevents double-billing: one run per (month, tenant_id).
-    """
     if not db_available():
         return
     with psycopg2.connect(DATABASE_URL) as conn:
@@ -336,31 +313,19 @@ def mark_ran_overage(month: str, tenant_id: str) -> None:
             )
 
 
-def stripe_ready() -> bool:
-    return bool(STRIPE_SECRET_KEY)
-
-
 # ============================================================
 # SMS SEND (Smstools)
 # ============================================================
 
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
-    """
-    Sends SMS via Smstools and increments outbound_count by 1 on success.
-    """
     if not to_number or not message:
-        log("⚠️ send_sms: missing to_number/message")
         return
 
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
         log("⚠️ Smstools credentials missing")
         return
 
-    payload = {
-        "message": message,
-        "to": to_number,
-        "sender": tenant["virtual_number"],
-    }
+    payload = {"message": message, "to": to_number, "sender": tenant["virtual_number"]}
     headers = {
         "X-Client-Id": SMSTOOLS_CLIENT_ID,
         "X-Client-Secret": SMSTOOLS_CLIENT_SECRET,
@@ -368,7 +333,7 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     }
 
     try:
-        r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=20)
+        r = requests.post(SMSTOOLS_SEND_URL, json=payload, headers=headers, timeout=25)
         log(f"📤 Smstools send status={r.status_code}")
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"], 1)
@@ -393,12 +358,9 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
     try:
         r = requests.post(
             f"{RETELL_BASE_URL}/create-chat",
-            headers={
-                "Authorization": f"Bearer {RETELL_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
             json={"agent_id": tenant["retell_agent_id"], "metadata": {"phone": phone}},
-            timeout=20,
+            timeout=25,
         )
         data = r.json() if r.content else {}
         chat_id = data.get("chat_id") or data.get("id")
@@ -424,12 +386,9 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
     try:
         r = requests.post(
             f"{RETELL_BASE_URL}/create-chat-completion",
-            headers={
-                "Authorization": f"Bearer {RETELL_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
             json={"chat_id": chat_id, "content": text},
-            timeout=25,
+            timeout=30,
         )
         data = r.json() if r.content else {}
 
@@ -481,12 +440,12 @@ def extract_calling_number(event: Dict[str, Any]) -> str:
 # ============================================================
 
 @app.route("/", methods=["GET"])
-def health() -> Tuple[str, int]:
+def health():
     return "OK", 200
 
 
 @app.route("/sms/inbound", methods=["POST"])
-def sms_inbound() -> Tuple[str, int]:
+def sms_inbound():
     payload = request.get_json(force=True, silent=True)
     event = extract_event(payload)
     if not event:
@@ -495,8 +454,6 @@ def sms_inbound() -> Tuple[str, int]:
     receiver = extract_receiver(event)
     sender = extract_sender(event)
     text = extract_text(event)
-
-    log(f"📩 /sms/inbound receiver={receiver} sender={sender} text_len={len(text)}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
@@ -511,7 +468,7 @@ def sms_inbound() -> Tuple[str, int]:
 
 
 @app.route("/call/missed", methods=["POST"])
-def call_missed() -> Tuple[str, int]:
+def call_missed():
     payload = request.get_json(force=True, silent=True)
     event = extract_event(payload)
     if not event:
@@ -519,8 +476,6 @@ def call_missed() -> Tuple[str, int]:
 
     receiver = extract_receiver(event)
     caller = extract_calling_number(event)
-
-    log(f"📞 /call/missed receiver={receiver} caller={caller}")
 
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
@@ -535,7 +490,7 @@ def call_missed() -> Tuple[str, int]:
 
 
 # ============================================================
-# ADMIN API (Google Sheets usage)
+# ADMIN: Usage (for Google Sheets)
 # ============================================================
 
 @app.route("/admin/usage", methods=["GET"])
@@ -561,10 +516,12 @@ def admin_usage():
                 )
                 rows = cur.fetchall()
 
-        out = []
+        data = []
         for (m, tenant_id, outbound) in rows:
             t = TENANTS_BY_ID.get(tenant_id, {})
-            out.append(
+            pc = get_overage_price_cents(t)
+
+            data.append(
                 {
                     "month": m,
                     "company_number": t.get("company_number", ""),
@@ -573,9 +530,12 @@ def admin_usage():
                     "stripe_customer_id": t.get("stripe_customer_id", ""),
                     "plan": t.get("plan", ""),
                     "outbound": int(outbound or 0),
+                    "price_cents": pc,
+                    "price_eur": pc / 100.0,
                 }
             )
-        return jsonify({"data": out}), 200
+
+        return jsonify({"data": data}), 200
 
     except Exception as e:
         log(f"❌ /admin/usage error: {e}")
@@ -600,7 +560,7 @@ def admin_bump():
 
     payload = request.get_json(force=True, silent=True) or {}
     tenant_id = (payload.get("tenant_id") or "").strip()
-    amount = int(payload.get("amount") or 1)
+    amount = to_int_safe(payload.get("amount"), 1)
 
     if not tenant_id:
         return jsonify({"error": "tenant_id required"}), 400
@@ -610,19 +570,17 @@ def admin_bump():
 
 
 # ============================================================
-# ADMIN STRIPE (invoice items overages)
+# ADMIN: Stripe overages (invoice items)
 # ============================================================
 
 @app.route("/admin/stripe/add-overages", methods=["POST"])
 def admin_stripe_add_overages():
     """
-    Adds invoice items to Stripe for overages (extra messages) for a given month.
+    Creates Stripe Invoice Items for overages for a given month.
+    Uses tenant-specific price from tenants.csv column: price_cents.
 
     Body (optional):
-      {
-        "month": "2026-02",       // default: previous month
-        "price_cents": 17         // default: 17
-      }
+      { "month": "2026-02" }    # default: previous month
     """
     auth = require_admin_token()
     if auth is not None:
@@ -639,13 +597,11 @@ def admin_stripe_add_overages():
 
     payload = request.get_json(force=True, silent=True) or {}
     month = (payload.get("month") or "").strip() or previous_month_key()
-    price_cents = int(payload.get("price_cents") or 17)
 
     rows = fetch_month_usage(month)
 
     result = {
         "month": month,
-        "price_cents": price_cents,
         "created": [],
         "skipped": {"no_customer": 0, "already_run": 0, "no_extra": 0},
     }
@@ -671,6 +627,7 @@ def admin_stripe_add_overages():
             mark_ran_overage(month, tenant_id)
             continue
 
+        price_cents = get_overage_price_cents(tenant)
         amount_cents = extra * price_cents
         desc = f"Extra berichten ({month}): {extra} × €{price_cents/100:.2f}"
 
@@ -685,22 +642,26 @@ def admin_stripe_add_overages():
                     "month": month,
                     "extra_count": str(extra),
                     "price_cents": str(price_cents),
+                    "plan": plan,
                 },
             )
+
             mark_ran_overage(month, tenant_id)
 
             result["created"].append(
                 {
                     "tenant_id": tenant_id,
                     "stripe_customer_id": stripe_customer_id,
+                    "plan": plan,
                     "extra": extra,
+                    "price_cents": price_cents,
                     "amount_cents": amount_cents,
                     "invoice_item_id": item.get("id"),
                 }
             )
         except Exception as e:
-            # Do NOT mark as ran if Stripe failed (so you can retry)
             log(f"❌ Stripe invoice item create failed tenant={tenant_id}: {e}")
+            # Don't mark ran if failed -> you can retry
 
     return jsonify(result), 200
 
@@ -715,3 +676,4 @@ ensure_monthly_usage_table()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
