@@ -1,4 +1,6 @@
 flask
-requests
 gunicorn
+requests
 psycopg2-binary
+stripe
+
