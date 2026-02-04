@@ -1,6 +1,7 @@
 tenant_id,stripe_id,company_name,company_number,virtual_number,retell_agent_id,plan,opening_line
 reactify,cus_TR96Sdz9LvHP8t,Bel_Wise,BE1023273586,32460260669,agent_41c11a24d9c427ef834e778a33,advanced,"Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent, hoe kan ik je helpen?"
-eleganza_test,cus_000000000000,eleganza_bv,BE00000000,32460224466,agent_ca80f632bcf7ada44ed8740cec,basic,"Bedankt om contact op te nemen met Eleganza, ik ben de virtuele assistent, hoe kan ik je helpen?"
+eleganza_test,cus_0000000000000,eleganza_bv,BE00000000,32460224466,agent_ca80f632bcf7ada44ed8740cec,basic,"Bedankt om contact op te nemen met Eleganza, ik ben de virtuele assistent, hoe kan ik je helpen?"
+
 
 
 
