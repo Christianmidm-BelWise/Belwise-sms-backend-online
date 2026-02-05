@@ -1,8 +1,8 @@
 import os
 import re
 import csv
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 import psycopg2
@@ -11,29 +11,27 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ============================================================
+# =========================
 # ENV / CONFIG
-# ============================================================
+# =========================
 
-# Smstools
 SMSTOOLS_CLIENT_ID = (os.environ.get("SMSTOOLS_CLIENT_ID") or "").strip()
 SMSTOOLS_CLIENT_SECRET = (os.environ.get("SMSTOOLS_CLIENT_SECRET") or "").strip()
 SMSTOOLS_SEND_URL = "https://api.smsgatewayapi.com/v1/message/send"
 
-# Retell
 RETELL_API_KEY = (os.environ.get("RETELL_API_KEY") or "").strip()
 RETELL_BASE_URL = "https://api.retellai.com"
 
-# DB
 RAW_DATABASE_URL = os.environ.get("DATABASE_URL") or ""
-
-# Admin
-ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN") or "").strip()
-
-# CSV
 TENANTS_CSV_PATH = os.environ.get("TENANTS_CSV_PATH") or "tenants.csv"
 
-# Logs
+# ✅ Admin token (met fallbacks)
+ADMIN_TOKEN = (
+    (os.environ.get("ADMIN_TOKEN") or "").strip()
+    or (os.environ.get("ADMIN_API_KEY") or "").strip()
+    or (os.environ.get("ADMIN_SECRET") or "").strip()
+)
+
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 
 
@@ -63,63 +61,6 @@ DATABASE_URL = sanitize_database_url(RAW_DATABASE_URL)
 
 def db_available() -> bool:
     return bool(DATABASE_URL)
-
-
-def _mask_token(t: str) -> str:
-    t = (t or "").strip()
-    if len(t) <= 8:
-        return "*" * len(t)
-    return t[:4] + "..." + t[-4:]
-
-
-def _extract_admin_token_from_request() -> str:
-    """
-    Accept token in:
-      - query param: ?token=...
-      - header: Authorization: Bearer <token>
-      - header: X-Admin-Token: <token>
-      - header: X-API-Key: <token>
-    """
-    # 1) query
-    token = (request.args.get("token") or "").strip()
-    if token:
-        return token
-
-    # 2) Authorization Bearer
-    auth = (request.headers.get("Authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-
-    # 3) custom headers
-    token = (request.headers.get("X-Admin-Token") or "").strip()
-    if token:
-        return token
-
-    token = (request.headers.get("X-API-Key") or "").strip()
-    if token:
-        return token
-
-    return ""
-
-
-def require_admin_token() -> Optional[Any]:
-    """
-    If ADMIN_TOKEN is empty -> no auth required (NOT recommended for prod).
-    """
-    if not ADMIN_TOKEN:
-        log("⚠️ ADMIN_TOKEN is empty -> admin endpoints are OPEN (set ADMIN_TOKEN in Render env).")
-        return None
-
-    provided = _extract_admin_token_from_request()
-
-    # Debug info (masked)
-    log(f"🔐 Admin auth check: expected={_mask_token(ADMIN_TOKEN)} provided={_mask_token(provided)} "
-        f"via={'query' if request.args.get('token') else 'headers' if provided else 'none'}")
-
-    if not provided or provided != ADMIN_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
-    return None
 
 
 def month_key(dt: Optional[datetime] = None) -> str:
@@ -157,15 +98,64 @@ def to_int_safe(value: Any, default: int = 0) -> int:
         return default
 
 
-# ============================================================
+def _mask_token(t: str) -> str:
+    t = (t or "").strip()
+    if len(t) <= 8:
+        return "*" * len(t)
+    return t[:4] + "..." + t[-4:]
+
+
+def _extract_admin_token_from_request() -> str:
+    """
+    Accept token in:
+      - query: ?token=...
+      - header: Authorization: Bearer <token>
+      - header: X-Admin-Token: <token>
+      - header: X-API-Key: <token>
+    """
+    token = (request.args.get("token") or "").strip()
+    if token:
+        return token
+
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+
+    token = (request.headers.get("X-Admin-Token") or "").strip()
+    if token:
+        return token
+
+    token = (request.headers.get("X-API-Key") or "").strip()
+    if token:
+        return token
+
+    return ""
+
+
+def require_admin_token() -> Optional[Any]:
+    """
+    If ADMIN_TOKEN is empty -> admin endpoints are OPEN (not recommended).
+    """
+    if not ADMIN_TOKEN:
+        log("⚠️ ADMIN_TOKEN is empty -> admin endpoints are OPEN.")
+        return None
+
+    provided = _extract_admin_token_from_request()
+    log(f"🔐 Admin auth check expected={_mask_token(ADMIN_TOKEN)} provided={_mask_token(provided)}")
+
+    if not provided or provided != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    return None
+
+
+# =========================
 # TENANTS (CSV)
-# ============================================================
+# =========================
 
 TENANTS_BY_VIRTUAL: Dict[str, Dict[str, Any]] = {}
 TENANTS_BY_ID: Dict[str, Dict[str, Any]] = {}
-
-# (tenant_id, phone) -> chat_id
-SMS_SESSIONS: Dict[Tuple[str, str], str] = {}
+SMS_SESSIONS: Dict[Tuple[str, str], str] = {}  # (tenant_id, phone) -> chat_id
 
 
 def load_tenants_from_csv(path: str) -> None:
@@ -196,7 +186,6 @@ def load_tenants_from_csv(path: str) -> None:
                 "virtual_number": virtual_raw,
                 "retell_agent_id": (row.get("retell_agent_id") or "").strip(),
                 "plan": (row.get("plan") or "").strip().lower(),
-                "price_cents": to_int_safe(row.get("price_cents"), 0),
                 "opening_line": (row.get("opening_line") or "").strip(),
             }
 
@@ -210,17 +199,14 @@ def get_tenant_by_receiver(receiver: str) -> Optional[Dict[str, Any]]:
     return TENANTS_BY_VIRTUAL.get(normalize_phone(receiver or ""))
 
 
-def get_overage_price_cents(tenant: Dict[str, Any]) -> int:
-    pc = to_int_safe(tenant.get("price_cents"), 0)
-    if pc > 0:
-        return pc
-    plan = (tenant.get("plan") or "").strip().lower()
-    return 17 if plan == "advanced" else 19
+def get_overage_price_eur(plan: str) -> float:
+    p = (plan or "").strip().lower()
+    return 0.17 if p == "advanced" else 0.19
 
 
-# ============================================================
+# =========================
 # DB: monthly_usage
-# ============================================================
+# =========================
 
 def ensure_monthly_usage_table() -> None:
     if not db_available():
@@ -269,9 +255,9 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
         log(f"⚠️ bump_monthly_outbound failed: {e}")
 
 
-# ============================================================
+# =========================
 # SMS SEND (Smstools)
-# ============================================================
+# =========================
 
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     if not to_number or not message:
@@ -298,9 +284,9 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
         log(f"⚠️ Smstools send error: {e}")
 
 
-# ============================================================
-# RETELL
-# ============================================================
+# =========================
+# RETELL (simple)
+# =========================
 
 def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
     key = (tenant["tenant_id"], phone)
@@ -324,13 +310,11 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
             return chat_id
     except Exception as e:
         log(f"⚠️ Retell create-chat error: {e}")
-
     return None
 
 
 def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
     opening = tenant.get("opening_line") or "Bedankt voor je bericht."
-
     if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
         return opening
 
@@ -346,7 +330,6 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
             timeout=30,
         )
         data = r.json() if r.content else {}
-
         for m in reversed(data.get("messages", [])):
             if m.get("role") == "agent":
                 content = (m.get("content") or "").strip()
@@ -357,42 +340,9 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
     return opening
 
 
-# ============================================================
-# WEBHOOK PARSING
-# ============================================================
-
-def extract_event(payload: Any) -> Optional[Dict[str, Any]]:
-    if payload is None:
-        return None
-    if isinstance(payload, list):
-        return payload[0] if payload else None
-    if isinstance(payload, dict):
-        return payload
-    return None
-
-
-def extract_receiver(event: Dict[str, Any]) -> str:
-    msg = event.get("message") or {}
-    return (msg.get("receiver") or event.get("receiver") or "").strip()
-
-
-def extract_sender(event: Dict[str, Any]) -> str:
-    msg = event.get("message") or {}
-    return (msg.get("sender") or event.get("sender") or event.get("from") or "").strip()
-
-
-def extract_text(event: Dict[str, Any]) -> str:
-    msg = event.get("message") or {}
-    return (msg.get("content") or event.get("content") or event.get("text") or "").strip()
-
-
-def extract_calling_number(event: Dict[str, Any]) -> str:
-    return ((event.get("caller") or "") or (event.get("from") or "") or extract_sender(event)).strip()
-
-
-# ============================================================
+# =========================
 # ROUTES
-# ============================================================
+# =========================
 
 @app.route("/", methods=["GET"])
 def health():
@@ -406,55 +356,6 @@ def admin_ping():
         return auth
     return jsonify({"ok": True}), 200
 
-
-@app.route("/sms/inbound", methods=["POST"])
-def sms_inbound():
-    payload = request.get_json(force=True, silent=True)
-    event = extract_event(payload)
-    if not event:
-        return "OK", 200
-
-    receiver = extract_receiver(event)
-    sender = extract_sender(event)
-    text = extract_text(event)
-
-    tenant = get_tenant_by_receiver(receiver)
-    if not tenant:
-        log(f"⚠️ /sms/inbound: no tenant for receiver={receiver} norm={normalize_phone(receiver)}")
-        return "OK", 200
-
-    if sender and text:
-        reply = ask_retell_via_sms(tenant, sender, text)
-        send_sms(tenant, sender, reply)
-
-    return "OK", 200
-
-
-@app.route("/call/missed", methods=["POST"])
-def call_missed():
-    payload = request.get_json(force=True, silent=True)
-    event = extract_event(payload)
-    if not event:
-        return "OK", 200
-
-    receiver = extract_receiver(event)
-    caller = extract_calling_number(event)
-
-    tenant = get_tenant_by_receiver(receiver)
-    if not tenant:
-        log(f"⚠️ /call/missed: no tenant for receiver={receiver} norm={normalize_phone(receiver)}")
-        return "OK", 200
-
-    if caller:
-        opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
-        send_sms(tenant, caller, opening)
-
-    return "OK", 200
-
-
-# ============================================================
-# ADMIN: Usage (for Google Sheets)
-# ============================================================
 
 @app.route("/admin/usage", methods=["GET"])
 def admin_usage():
@@ -479,62 +380,80 @@ def admin_usage():
                 )
                 rows = cur.fetchall()
 
-        data = []
+        out = []
         for (m, tenant_id, outbound) in rows:
             t = TENANTS_BY_ID.get(tenant_id, {})
-            pc = get_overage_price_cents(t)
-
-            data.append(
+            plan = (t.get("plan") or "").strip().lower()
+            out.append(
                 {
                     "month": m,
                     "company_number": t.get("company_number", ""),
                     "company_name": t.get("company_name", ""),
                     "tenant_id": tenant_id,
                     "stripe_customer_id": t.get("stripe_customer_id", ""),
-                    "plan": t.get("plan", ""),
+                    "plan": plan,
                     "outbound": int(outbound or 0),
-                    "price_cents": pc,
-                    "price_eur": pc / 100.0,
+                    "price_eur": get_overage_price_eur(plan),
                 }
             )
 
-        return jsonify({"data": data}), 200
+        return jsonify({"data": out}), 200
 
     except Exception as e:
         log(f"❌ /admin/usage error: {e}")
         return jsonify({"error": "internal_error", "data": []}), 500
 
 
-@app.route("/admin/reload-tenants", methods=["POST"])
-def admin_reload_tenants():
-    auth = require_admin_token()
-    if auth is not None:
-        return auth
+@app.route("/sms/inbound", methods=["POST"])
+def sms_inbound():
+    payload = request.get_json(force=True, silent=True)
+    event = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(event, dict):
+        return "OK", 200
 
-    load_tenants_from_csv(TENANTS_CSV_PATH)
-    return jsonify({"ok": True, "tenants": len(TENANTS_BY_ID)}), 200
+    msg = event.get("message") or {}
+    receiver = (msg.get("receiver") or event.get("receiver") or "").strip()
+    sender = (msg.get("sender") or event.get("sender") or event.get("from") or "").strip()
+    text = (msg.get("content") or event.get("content") or event.get("text") or "").strip()
 
+    tenant = get_tenant_by_receiver(receiver)
+    if not tenant:
+        log(f"⚠️ /sms/inbound: no tenant for receiver={receiver}")
+        return "OK", 200
 
-@app.route("/admin/bump", methods=["POST"])
-def admin_bump():
-    auth = require_admin_token()
-    if auth is not None:
-        return auth
+    if sender and text:
+        reply = ask_retell_via_sms(tenant, sender, text)
+        send_sms(tenant, sender, reply)
 
-    payload = request.get_json(force=True, silent=True) or {}
-    tenant_id = (payload.get("tenant_id") or "").strip()
-    amount = to_int_safe(payload.get("amount"), 1)
-
-    if not tenant_id:
-        return jsonify({"error": "tenant_id required"}), 400
-
-    bump_monthly_outbound(tenant_id, amount)
-    return jsonify({"ok": True}), 200
+    return "OK", 200
 
 
-# ============================================================
+@app.route("/call/missed", methods=["POST"])
+def call_missed():
+    payload = request.get_json(force=True, silent=True)
+    event = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(event, dict):
+        return "OK", 200
+
+    msg = event.get("message") or {}
+    receiver = (msg.get("receiver") or event.get("receiver") or "").strip()
+    caller = (event.get("caller") or event.get("from") or msg.get("sender") or "").strip()
+
+    tenant = get_tenant_by_receiver(receiver)
+    if not tenant:
+        log(f"⚠️ /call/missed: no tenant for receiver={receiver}")
+        return "OK", 200
+
+    if caller:
+        opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
+        send_sms(tenant, caller, opening)
+
+    return "OK", 200
+
+
+# =========================
 # STARTUP
-# ============================================================
+# =========================
 
 load_tenants_from_csv(TENANTS_CSV_PATH)
 ensure_monthly_usage_table()
@@ -542,3 +461,4 @@ ensure_monthly_usage_table()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
