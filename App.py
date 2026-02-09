@@ -259,9 +259,41 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
 # SMS SEND (Smstools)
 # =========================
 
+def normalize_money_for_sms(text: str) -> str:
+    """
+    SMS-safe money formatting:
+    - Replace euro symbol and EUR with the word 'euro'
+    - Convert patterns like '€59' or '59€' to '59 euro'
+    - Keep it simple and robust for common cases
+    """
+    if not text:
+        return text
+
+    s = text
+
+    # Normalize EUR tokens
+    s = re.sub(r"\bEUR\b", "euro", s, flags=re.IGNORECASE)
+
+    # Convert "€59" / "€ 59" -> "59 euro"
+    s = re.sub(r"€\s*([0-9]+(?:[.,][0-9]{1,2})?)", r"\1 euro", s)
+
+    # Convert "59€" / "59 €" -> "59 euro"
+    s = re.sub(r"([0-9]+(?:[.,][0-9]{1,2})?)\s*€", r"\1 euro", s)
+
+    # Any remaining '€' becomes 'euro' (fallback)
+    s = s.replace("€", "euro")
+
+    # Tidy multiple spaces
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
 def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
     if not to_number or not message:
         return
+        
+    # ✅ Force SMS-safe money formatting for all tenants
+    message = normalize_money_for_sms(message)
+    
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
         log("⚠️ Smstools credentials missing")
         return
