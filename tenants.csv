@@ -1,6 +1,7 @@
 tenant_id,stripe_customer_id,company_name,company_number,virtual_number,retell_agent_id,plan,price_cents,opening_line
 reactify,cus_TR96Sdz9LvHP8t,Bel_Wise,BE1023273586,32460260669,agent_41c11a24d9c427ef834e778a33,advanced,17,"Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent, hoe kan ik je helpen?"
-olas,cus_0000000000000,olas,BE0783342702,32460224466,agent_ae2321e18bf8bb4de219ab34eb,basic,19,"Welkom bij OLAS, er wordt in stilte gewerkt dus je kan hier je vragen stellen aan onze digitale assistent."
+olas,cus_0000000000000,olas,BE0783342702,32460224466,agent_ca80f632bcf7ada44ed8740cec,basic,19,"Welkom bij OLAS, er wordt in stilte gewerkt dus je kan hier je vragen stellen aan onze digitale assistent."
+
 
 
 
