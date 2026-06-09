@@ -348,7 +348,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                 if normalized_phone:
                     cur.execute(
                         """
-                        SELECT id FROM conversations
+                        SELECT id, status FROM conversations
                         WHERE tenant_id = %s AND contact_phone = %s
                         ORDER BY updated_at DESC
                         LIMIT 1;
@@ -358,6 +358,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     existing = cur.fetchone()
                 if existing:
                     conv_id = existing[0]
+                    existing_status = existing[1] if len(existing) > 1 else 'ai-active'
                     cur.execute(
                         """
                         UPDATE conversations
@@ -369,7 +370,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                         """,
                         (name or "", email or "", channel or "sms", conv_id),
                     )
-                    return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": name, "contact_email": email, "channel": channel}
+                    return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": name, "contact_email": email, "channel": channel, "status": existing_status}
                 conv_id = new_id("conv")
                 display_name = name or (phone or "Onbekende klant")
                 cur.execute(
@@ -379,7 +380,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     """,
                     (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
                 )
-                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel}
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "ai-active"}
     except Exception as e:
         log(f"⚠️ get_or_create_conversation failed: {e}")
         return None
@@ -618,6 +619,41 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
     return opening
 
 
+
+
+def is_ai_disabled_status(status: str) -> bool:
+    s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "inactive", "closed")
+
+
+def set_conversation_status(conversation_id: str, tenant_id: str, status: str, requires_human: Optional[bool] = None) -> None:
+    if not db_available() or not conversation_id:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                if requires_human is None:
+                    cur.execute(
+                        """
+                        UPDATE conversations
+                        SET status = %s, updated_at = NOW()
+                        WHERE id = %s AND tenant_id = %s;
+                        """,
+                        (status, conversation_id, tenant_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE conversations
+                        SET status = %s, requires_human = %s, updated_at = NOW()
+                        WHERE id = %s AND tenant_id = %s;
+                        """,
+                        (status, bool(requires_human), conversation_id, tenant_id),
+                    )
+    except Exception as e:
+        log(f"⚠️ set_conversation_status failed: {e}")
+
+
 # =========================
 # ROUTES
 # =========================
@@ -701,18 +737,31 @@ def sms_inbound():
 
     if sender and text:
         conv = get_or_create_conversation(tenant, phone=sender, channel="sms")
+        analysis = classify_text_basic(text)
+        current_status = (conv or {}).get("status") or "ai-active"
+
         if conv:
             add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms")
-            update_conversation_ai(conv["id"], classify_text_basic(text))
+            # Als de ondernemer al heeft overgenomen, blijft AI uit.
+            # Als de klant expliciet menselijke hulp nodig heeft, schakelen we AI meteen uit.
+            if is_ai_disabled_status(current_status):
+                set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
+                log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
+                return "OK", 200
+            update_conversation_ai(conv["id"], analysis)
+            if analysis.get("requiresHuman"):
+                set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
+                log(f"🤝 Human takeover required for conversation={conv['id']}; Retell skipped")
+                return "OK", 200
 
         reply = ask_retell_via_sms(tenant, sender, text)
         send_sms(tenant, sender, reply)
 
         if conv and reply:
             add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms")
-            # Herbereken status na het AI-antwoord, maar respecteer expliciete menselijke overname.
-            analysis = classify_text_basic(text)
-            update_conversation_ai(conv["id"], analysis)
+            # Status blijft AI actief, tenzij er ondertussen menselijke overname nodig was.
+            if not analysis.get("requiresHuman"):
+                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
 
     return "OK", 200
 
@@ -748,7 +797,7 @@ def call_missed():
 
 
 
-@app.route("/conversations", methods=["GET", "DELETE"])
+@app.route("/conversations", methods=["GET", "PATCH", "POST", "DELETE"])
 def conversations():
     tenant = get_tenant_from_request_or_default()
     if not tenant or not db_available():
@@ -767,6 +816,21 @@ def conversations():
             if not deleted:
                 return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
             return jsonify({"status": "success", "data": {"id": conversation_id, "deleted": True}}), 200
+        if request.method in ("PATCH", "POST"):
+            body = request.get_json(force=True, silent=True) or {}
+            conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
+            status = (body.get("status") or body.get("conversationStatus") or "").strip()
+            ai_enabled = body.get("aiEnabled")
+            if ai_enabled is not None and not status:
+                status = "ai-active" if bool(ai_enabled) else "menselijke_overname"
+            if not conversation_id:
+                return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+            if not status:
+                return jsonify({"status": "error", "error": "status ontbreekt."}), 400
+            requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
+            set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
+            return jsonify({"status": "success", "data": {"id": conversation_id, "status": status, "aiEnabled": not requires_human}}), 200
+
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -775,10 +839,10 @@ def conversations():
                     SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
                            c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
                            c.recommended_action, c.suggested_reply, c.created_at, c.updated_at,
-                           lm.body AS last_message, lm.created_at AS last_message_at
+                           lm.body AS last_message, lm.created_at AS last_message_at, lm.direction AS last_message_direction
                     FROM conversations c
                     LEFT JOIN LATERAL (
-                      SELECT body, created_at FROM conversation_messages m
+                      SELECT body, created_at, direction FROM conversation_messages m
                       WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
                     ) lm ON TRUE
                     WHERE c.tenant_id = %s
@@ -796,7 +860,7 @@ def conversations():
                 "intent": r[7] or "", "urgency": r[8] or "", "requires_human": bool(r[9]), "summary": r[10] or "",
                 "recommended_action": r[11] or "", "suggested_reply": r[12] or "",
                 "created_at": r[13].isoformat() if r[13] else None, "updated_at": r[14].isoformat() if r[14] else None,
-                "last_message": r[15] or "", "last_message_at": r[16].isoformat() if r[16] else None,
+                "last_message": r[15] or "", "last_message_at": r[16].isoformat() if r[16] else None, "last_message_direction": r[17] or "",
             })
         return jsonify({"status": "success", "data": data}), 200
     except Exception as e:
@@ -862,11 +926,9 @@ def inbox_send_sms():
             return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
         send_sms(tenant, phone, message)
         msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms")
-        # Een manueel antwoord vanuit Reactify betekent dat de ondernemer heeft overgenomen.
-        # Sluit niet automatisch af; behoud of herbereken alleen op basis van de inhoud van het antwoord.
-        if any(w in message.lower() for w in ["tot dan", "afgesproken", "in orde", "graag gedaan", "bedankt"]):
-            update_conversation_ai(conversation_id, classify_text_basic(message))
-        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id}}), 200
+        # Elk manueel bericht vanuit Reactify betekent: ondernemer heeft overgenomen, AI blijft uit.
+        set_conversation_status(conversation_id, tenant_id, "menselijke_overname", True)
+        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "status": "menselijke_overname", "aiEnabled": False}}), 200
     except Exception as e:
         log(f"❌ /send-sms error: {e}")
         return jsonify({"status": "error", "error": "SMS verzenden mislukt.", "details": str(e)}), 500
