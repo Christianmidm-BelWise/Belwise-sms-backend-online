@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -255,6 +256,195 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
         log(f"⚠️ bump_monthly_outbound failed: {e}")
 
 
+
+
+# =========================
+# DB: conversations + messages
+# =========================
+
+def ensure_conversation_tables() -> None:
+    if not db_available():
+        log("⚠️ DATABASE_URL missing; conversations disabled")
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversations (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      contact_phone TEXT,
+                      contact_email TEXT,
+                      contact_name TEXT,
+                      channel TEXT NOT NULL DEFAULT 'sms',
+                      status TEXT NOT NULL DEFAULT 'ai-active',
+                      intent TEXT,
+                      urgency TEXT,
+                      requires_human BOOLEAN NOT NULL DEFAULT FALSE,
+                      summary TEXT,
+                      recommended_action TEXT,
+                      suggested_reply TEXT,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+
+                    CREATE TABLE IF NOT EXISTS conversation_messages (
+                      id TEXT PRIMARY KEY,
+                      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                      tenant_id TEXT NOT NULL,
+                      direction TEXT NOT NULL,
+                      channel TEXT NOT NULL DEFAULT 'sms',
+                      body TEXT NOT NULL,
+                      external_id TEXT,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_conversations_tenant_updated
+                      ON conversations (tenant_id, updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_conversations_phone
+                      ON conversations (tenant_id, contact_phone);
+                    CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
+                      ON conversation_messages (conversation_id, created_at ASC);
+                    """
+                )
+        log("✅ conversation tables ensured")
+    except Exception as e:
+        log(f"⚠️ ensure_conversation_tables failed: {e}")
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def get_default_tenant() -> Optional[Dict[str, Any]]:
+    if TENANTS_BY_ID:
+        return next(iter(TENANTS_BY_ID.values()))
+    return None
+
+
+def get_tenant_from_request_or_default() -> Optional[Dict[str, Any]]:
+    tenant_id = (
+        request.args.get("tenant_id")
+        or request.args.get("tenantId")
+        or request.headers.get("X-Tenant-Id")
+        or ""
+    ).strip()
+    if tenant_id and tenant_id in TENANTS_BY_ID:
+        return TENANTS_BY_ID[tenant_id]
+    return get_default_tenant()
+
+
+def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: str = "", email: str = "", channel: str = "sms") -> Optional[Dict[str, Any]]:
+    if not db_available() or not tenant:
+        return None
+    normalized_phone = normalize_phone(phone) if phone else ""
+    tenant_id = tenant["tenant_id"]
+    try:
+        ensure_conversation_tables()
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                existing = None
+                if normalized_phone:
+                    cur.execute(
+                        """
+                        SELECT id FROM conversations
+                        WHERE tenant_id = %s AND contact_phone = %s
+                        ORDER BY updated_at DESC
+                        LIMIT 1;
+                        """,
+                        (tenant_id, normalized_phone),
+                    )
+                    existing = cur.fetchone()
+                if existing:
+                    conv_id = existing[0]
+                    cur.execute(
+                        """
+                        UPDATE conversations
+                        SET contact_name = COALESCE(NULLIF(%s, ''), contact_name),
+                            contact_email = COALESCE(NULLIF(%s, ''), contact_email),
+                            channel = COALESCE(NULLIF(%s, ''), channel),
+                            updated_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (name or "", email or "", channel or "sms", conv_id),
+                    )
+                    return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": name, "contact_email": email, "channel": channel}
+                conv_id = new_id("conv")
+                display_name = name or (phone or "Onbekende klant")
+                cur.execute(
+                    """
+                    INSERT INTO conversations (id, tenant_id, contact_phone, contact_email, contact_name, channel, status, summary)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'ai-active', %s);
+                    """,
+                    (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
+                )
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel}
+    except Exception as e:
+        log(f"⚠️ get_or_create_conversation failed: {e}")
+        return None
+
+
+def add_conversation_message(conversation_id: str, tenant_id: str, direction: str, body: str, channel: str = "sms", external_id: str = "") -> Optional[str]:
+    if not db_available() or not conversation_id or not body:
+        return None
+    try:
+        ensure_conversation_tables()
+        msg_id = new_id("msg")
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conversation_messages (id, conversation_id, tenant_id, direction, channel, body, external_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    """,
+                    (msg_id, conversation_id, tenant_id, direction, channel or "sms", body, external_id or ""),
+                )
+                cur.execute("UPDATE conversations SET updated_at = NOW() WHERE id = %s;", (conversation_id,))
+        return msg_id
+    except Exception as e:
+        log(f"⚠️ add_conversation_message failed: {e}")
+        return None
+
+
+def classify_text_basic(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+    wants_booking = any(w in t for w in ["afspraak", "boeken", "inplannen", "planning", "wanneer", "beschikbaar", "morgen", "vandaag", "week"])
+    urgent = any(w in t for w in ["dringend", "spoed", "vandaag", "asap", "meteen", "snel", "urgent"])
+    negative = any(w in t for w in ["boos", "klacht", "niet tevreden", "probleem", "annuleren", "fout"])
+    requires_human = urgent or negative or any(w in t for w in ["mens", "persoon", "bellen", "bel mij", "contact opnemen"])
+    intent = "afspraak_maken" if wants_booking else "vraag_stellen"
+    urgency = "hoog" if urgent else ("medium" if negative else "normaal")
+    summary = "De klant wil een afspraak maken of een beschikbaar moment vinden." if wants_booking else "De klant heeft een vraag of verwacht verdere opvolging."
+    if urgent:
+        summary = "De klant vraagt snelle opvolging en verwacht vandaag of zo snel mogelijk reactie."
+    if negative:
+        summary = "De klant lijkt ontevreden of meldt een probleem. Menselijke opvolging is aanbevolen."
+    recommended = "Neem het gesprek over en stel twee concrete momenten voor." if wants_booking or requires_human else "Laat AI antwoorden, maar volg op als de klant bijkomende vragen stelt."
+    suggested = "Dag, ik kan u hiermee helpen. Past woensdag om 10u of donderdag om 14u?" if wants_booking else "Dag, bedankt voor uw bericht. Ik kijk dit even na en kom hier zo snel mogelijk op terug."
+    return {"intent": intent, "urgency": urgency, "requiresHuman": requires_human, "summary": summary, "recommendedAction": recommended, "suggestedReply": suggested}
+
+
+def update_conversation_ai(conversation_id: str, analysis: Dict[str, Any]) -> None:
+    if not db_available() or not conversation_id:
+        return
+    try:
+        status = "menselijke_overname" if analysis.get("requiresHuman") else "ai-active"
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET intent = %s, urgency = %s, requires_human = %s, summary = %s,
+                        recommended_action = %s, suggested_reply = %s, status = %s, updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (analysis.get("intent"), analysis.get("urgency"), bool(analysis.get("requiresHuman")), analysis.get("summary"), analysis.get("recommendedAction"), analysis.get("suggestedReply"), status, conversation_id),
+                )
+    except Exception as e:
+        log(f"⚠️ update_conversation_ai failed: {e}")
+
+
 # =========================
 # SMS SEND (Smstools)
 # =========================
@@ -454,8 +644,16 @@ def sms_inbound():
         return "OK", 200
 
     if sender and text:
+        conv = get_or_create_conversation(tenant, phone=sender, channel="sms")
+        if conv:
+            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms")
+            update_conversation_ai(conv["id"], classify_text_basic(text))
+
         reply = ask_retell_via_sms(tenant, sender, text)
         send_sms(tenant, sender, reply)
+
+        if conv and reply:
+            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms")
 
     return "OK", 200
 
@@ -478,9 +676,144 @@ def call_missed():
 
     if caller:
         opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
+        conv = get_or_create_conversation(tenant, phone=caller, channel="missed_call")
+        if conv:
+            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "missed_call")
+            update_conversation_ai(conv["id"], classify_text_basic("Gemiste oproep. Klant verwacht terugkoppeling."))
         send_sms(tenant, caller, opening)
+        if conv:
+            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", opening, "sms")
 
     return "OK", 200
+
+
+
+
+@app.route("/conversations", methods=["GET"])
+def conversations():
+    tenant = get_tenant_from_request_or_default()
+    if not tenant or not db_available():
+        return jsonify({"status": "success", "data": []}), 200
+    try:
+        ensure_conversation_tables()
+        limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
+                           c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
+                           c.recommended_action, c.suggested_reply, c.created_at, c.updated_at,
+                           lm.body AS last_message, lm.created_at AS last_message_at
+                    FROM conversations c
+                    LEFT JOIN LATERAL (
+                      SELECT body, created_at FROM conversation_messages m
+                      WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
+                    ) lm ON TRUE
+                    WHERE c.tenant_id = %s
+                    ORDER BY c.updated_at DESC
+                    LIMIT %s;
+                    """,
+                    (tenant["tenant_id"], limit),
+                )
+                rows = cur.fetchall()
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0], "tenant_id": r[1], "contact_phone": r[2] or "", "contact_email": r[3] or "",
+                "contact_name": r[4] or r[2] or "Onbekende klant", "channel": r[5] or "sms", "status": r[6] or "ai-active",
+                "intent": r[7] or "", "urgency": r[8] or "", "requires_human": bool(r[9]), "summary": r[10] or "",
+                "recommended_action": r[11] or "", "suggested_reply": r[12] or "",
+                "created_at": r[13].isoformat() if r[13] else None, "updated_at": r[14].isoformat() if r[14] else None,
+                "last_message": r[15] or "", "last_message_at": r[16].isoformat() if r[16] else None,
+            })
+        return jsonify({"status": "success", "data": data}), 200
+    except Exception as e:
+        log(f"❌ /conversations error: {e}")
+        return jsonify({"status": "error", "error": "Kon gesprekken niet ophalen.", "details": str(e)}), 500
+
+
+@app.route("/conversation-messages", methods=["GET"])
+def conversation_messages():
+    conversation_id = (request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
+    if not conversation_id:
+        return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+    if not db_available():
+        return jsonify({"status": "success", "data": []}), 200
+    try:
+        ensure_conversation_tables()
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, conversation_id, tenant_id, direction, channel, body, external_id, created_at
+                    FROM conversation_messages
+                    WHERE conversation_id = %s
+                    ORDER BY created_at ASC;
+                    """,
+                    (conversation_id,),
+                )
+                rows = cur.fetchall()
+        data = [{
+            "id": r[0], "conversation_id": r[1], "tenant_id": r[2], "direction": r[3], "channel": r[4],
+            "body": r[5], "text": r[5], "external_id": r[6] or "", "created_at": r[7].isoformat() if r[7] else None,
+        } for r in rows]
+        return jsonify({"status": "success", "data": data}), 200
+    except Exception as e:
+        log(f"❌ /conversation-messages error: {e}")
+        return jsonify({"status": "error", "error": "Kon berichten niet ophalen.", "details": str(e)}), 500
+
+
+@app.route("/send-sms", methods=["POST"])
+def inbox_send_sms():
+    body = request.get_json(force=True, silent=True) or {}
+    conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
+    message = (body.get("message") or body.get("text") or "").strip()
+    if not conversation_id:
+        return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+    if not message:
+        return jsonify({"status": "error", "error": "Bericht ontbreekt."}), 400
+    if not db_available():
+        return jsonify({"status": "error", "error": "DATABASE_URL ontbreekt."}), 500
+    try:
+        ensure_conversation_tables()
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT tenant_id, contact_phone FROM conversations WHERE id = %s LIMIT 1;", (conversation_id,))
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
+        tenant_id, phone = row
+        tenant = TENANTS_BY_ID.get(tenant_id)
+        if not tenant:
+            return jsonify({"status": "error", "error": "Tenant niet gevonden."}), 404
+        if not phone:
+            return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
+        send_sms(tenant, phone, message)
+        msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms")
+        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id}}), 200
+    except Exception as e:
+        log(f"❌ /send-sms error: {e}")
+        return jsonify({"status": "error", "error": "SMS verzenden mislukt.", "details": str(e)}), 500
+
+
+@app.route("/classify-conversation", methods=["POST"])
+def classify_conversation():
+    body = request.get_json(force=True, silent=True) or {}
+    conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
+    if not conversation_id:
+        return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT body FROM conversation_messages WHERE conversation_id = %s ORDER BY created_at DESC LIMIT 10;", (conversation_id,))
+                text = "\n".join(r[0] for r in cur.fetchall())
+        analysis = classify_text_basic(text)
+        update_conversation_ai(conversation_id, analysis)
+        return jsonify({"status": "success", "data": analysis}), 200
+    except Exception as e:
+        log(f"❌ /classify-conversation error: {e}")
+        return jsonify({"status": "error", "error": "Classificatie mislukt.", "details": str(e)}), 500
 
 
 # =========================
@@ -489,6 +822,7 @@ def call_missed():
 
 load_tenants_from_csv(TENANTS_CSV_PATH)
 ensure_monthly_usage_table()
+ensure_conversation_tables()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
