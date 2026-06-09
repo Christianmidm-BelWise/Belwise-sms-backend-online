@@ -408,28 +408,84 @@ def add_conversation_message(conversation_id: str, tenant_id: str, direction: st
 
 
 def classify_text_basic(text: str) -> Dict[str, Any]:
+    """
+    Snelle, betrouwbare status-classificatie voor Reactify Inbox.
+    Deze regels draaien vóór of naast Retell, zodat expliciete menselijke-overname woorden
+    zoals "medewerker" altijd correct naar Overname nodig gaan.
+    """
     t = (text or "").lower()
-    wants_booking = any(w in t for w in ["afspraak", "boeken", "inplannen", "planning", "wanneer", "beschikbaar", "morgen", "vandaag", "week"])
-    urgent = any(w in t for w in ["dringend", "spoed", "vandaag", "asap", "meteen", "snel", "urgent"])
-    negative = any(w in t for w in ["boos", "klacht", "niet tevreden", "probleem", "annuleren", "fout"])
-    requires_human = urgent or negative or any(w in t for w in ["mens", "persoon", "bellen", "bel mij", "contact opnemen"])
-    intent = "afspraak_maken" if wants_booking else "vraag_stellen"
-    urgency = "hoog" if urgent else ("medium" if negative else "normaal")
-    summary = "De klant wil een afspraak maken of een beschikbaar moment vinden." if wants_booking else "De klant heeft een vraag of verwacht verdere opvolging."
-    if urgent:
-        summary = "De klant vraagt snelle opvolging en verwacht vandaag of zo snel mogelijk reactie."
-    if negative:
+
+    wants_booking = any(w in t for w in [
+        "afspraak", "boeken", "inplannen", "planning", "wanneer", "beschikbaar",
+        "morgen", "vandaag", "deze week", "volgende week", "reservatie", "reserveren"
+    ])
+
+    urgent = any(w in t for w in [
+        "dringend", "spoed", "vandaag", "asap", "meteen", "snel", "urgent",
+        "zo snel mogelijk", "onmiddellijk"
+    ])
+
+    negative = any(w in t for w in [
+        "boos", "klacht", "klacht indienen", "niet tevreden", "ontevreden",
+        "probleem", "fout", "slecht", "teleurgesteld", "annuleren"
+    ])
+
+    human_request = any(w in t for w in [
+        "medewerker", "een medewerker", "persoon", "mens", "iemand spreken",
+        "iemand aan de lijn", "bellen", "bel mij", "bel me", "contact opnemen",
+        "zaakvoerder", "manager", "verantwoordelijke", "klantendienst"
+    ])
+
+    inactive = any(w in t for w in [
+        "ok bedankt", "oke bedankt", "dank u", "bedankt", "merci", "top bedankt",
+        "in orde", "is goed", "prima", "tot dan", "afgesproken"
+    ]) and not (wants_booking or urgent or negative or human_request)
+
+    requires_human = bool(urgent or negative or human_request)
+    intent = "afspraak_maken" if wants_booking else ("menselijke_overname" if human_request else "vraag_stellen")
+    urgency = "hoog" if urgent else ("medium" if (negative or human_request) else "normaal")
+
+    if inactive:
+        summary = "Het gesprek lijkt afgerond. Er is momenteel geen verdere actie nodig."
+        recommended = "Geen actie nodig, tenzij de klant opnieuw reageert."
+        suggested = "Graag gedaan. Laat gerust iets weten als ik nog kan helpen."
+    elif human_request:
+        summary = "De klant vraagt expliciet om een medewerker of menselijke opvolging."
+        recommended = "Neem het gesprek over en reageer persoonlijk."
+        suggested = "Dag, ik geef dit door aan een medewerker. We komen zo snel mogelijk bij u terug."
+    elif negative:
         summary = "De klant lijkt ontevreden of meldt een probleem. Menselijke opvolging is aanbevolen."
-    recommended = "Neem het gesprek over en stel twee concrete momenten voor." if wants_booking or requires_human else "Laat AI antwoorden, maar volg op als de klant bijkomende vragen stelt."
-    suggested = "Dag, ik kan u hiermee helpen. Past woensdag om 10u of donderdag om 14u?" if wants_booking else "Dag, bedankt voor uw bericht. Ik kijk dit even na en kom hier zo snel mogelijk op terug."
-    return {"intent": intent, "urgency": urgency, "requiresHuman": requires_human, "summary": summary, "recommendedAction": recommended, "suggestedReply": suggested}
+        recommended = "Neem het gesprek over, erken het probleem en stel een concrete oplossing voor."
+        suggested = "Dag, bedankt om dit te melden. Ik kijk dit meteen na en kom zo snel mogelijk bij u terug."
+    elif urgent:
+        summary = "De klant vraagt snelle opvolging en verwacht vandaag of zo snel mogelijk reactie."
+        recommended = "Neem het gesprek over of geef onmiddellijk een concreet beschikbaar moment."
+        suggested = "Dag, ik bekijk dit met prioriteit en kom zo snel mogelijk bij u terug."
+    elif wants_booking:
+        summary = "De klant wil een afspraak maken of een beschikbaar moment vinden."
+        recommended = "Stel twee concrete momenten voor of maak meteen een afspraak via Cal.com."
+        suggested = "Dag, ik kan u hiermee helpen. Past woensdag om 10u of donderdag om 14u?"
+    else:
+        summary = "De klant heeft een vraag of verwacht verdere opvolging."
+        recommended = "Laat AI antwoorden, maar volg op als de klant bijkomende vragen stelt."
+        suggested = "Dag, bedankt voor uw bericht. Ik kijk dit even na en kom hier zo snel mogelijk op terug."
+
+    return {
+        "intent": intent,
+        "urgency": urgency,
+        "requiresHuman": requires_human,
+        "inactive": inactive,
+        "summary": summary,
+        "recommendedAction": recommended,
+        "suggestedReply": suggested,
+    }
 
 
 def update_conversation_ai(conversation_id: str, analysis: Dict[str, Any]) -> None:
     if not db_available() or not conversation_id:
         return
     try:
-        status = "menselijke_overname" if analysis.get("requiresHuman") else "ai-active"
+        status = "afgesloten" if analysis.get("inactive") else ("menselijke_overname" if analysis.get("requiresHuman") else "ai-active")
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -654,6 +710,9 @@ def sms_inbound():
 
         if conv and reply:
             add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms")
+            # Herbereken status na het AI-antwoord, maar respecteer expliciete menselijke overname.
+            analysis = classify_text_basic(text)
+            update_conversation_ai(conv["id"], analysis)
 
     return "OK", 200
 
@@ -791,6 +850,10 @@ def inbox_send_sms():
             return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
         send_sms(tenant, phone, message)
         msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms")
+        # Een manueel antwoord vanuit Reactify betekent dat de ondernemer heeft overgenomen.
+        # Sluit niet automatisch af; behoud of herbereken alleen op basis van de inhoud van het antwoord.
+        if any(w in message.lower() for w in ["tot dan", "afgesproken", "in orde", "graag gedaan", "bedankt"]):
+            update_conversation_ai(conversation_id, classify_text_basic(message))
         return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id}}), 200
     except Exception as e:
         log(f"❌ /send-sms error: {e}")
