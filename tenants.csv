@@ -1,5 +1,5 @@
 tenant_id,stripe_customer_id,company_name,company_number,virtual_number,retell_agent_id,plan,price_cents,opening_line
-reactify,cus_TR96Sdz9LvHP8t,Bel_Wise,BE1023273586,32460260667,agent_41c11a24d9c427ef834e778a33,advanced,17,"Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent, hoe kan ik je helpen?"
+reactify,cus_TR96Sdz9LvHP8t,Bel_Wise,BE1023273586,+32460260667,agent_41c11a24d9c427ef834e778a33,advanced,17,"Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent, hoe kan ik je helpen?"
 
 
 
