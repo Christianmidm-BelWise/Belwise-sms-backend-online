@@ -748,13 +748,25 @@ def call_missed():
 
 
 
-@app.route("/conversations", methods=["GET"])
+@app.route("/conversations", methods=["GET", "DELETE"])
 def conversations():
     tenant = get_tenant_from_request_or_default()
     if not tenant or not db_available():
         return jsonify({"status": "success", "data": []}), 200
     try:
         ensure_conversation_tables()
+        if request.method == "DELETE":
+            body = request.get_json(force=True, silent=True) or {}
+            conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
+            if not conversation_id:
+                return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
+                    deleted = cur.fetchone()
+            if not deleted:
+                return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
+            return jsonify({"status": "success", "data": {"id": conversation_id, "deleted": True}}), 200
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
