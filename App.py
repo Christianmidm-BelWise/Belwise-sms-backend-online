@@ -400,7 +400,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     INSERT INTO conversations (id, tenant_id, contact_phone, contact_email, contact_name, channel, status, summary)
                     VALUES (%s, %s, %s, %s, %s, %s, 'ai-active', %s);
                     """,
-                    (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
+                    (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", ""),
                 )
                 return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "inactive"}
     except Exception as e:
@@ -436,7 +436,9 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
     Deze regels draaien vóór of naast Retell, zodat expliciete menselijke-overname woorden
     zoals "medewerker" altijd correct naar Overname nodig gaan.
     """
-    t = (text or "").lower()
+    t = (text or "").lower().strip()
+    compact = re.sub(r"[\s.!?,;:]+", " ", t).strip()
+    greeting_only = compact in {"hoi", "hallo", "hey", "heey", "hi", "dag", "goedendag", "goeiedag", "goedemorgen", "goedenavond", "yo", "hoi daar", "hallo daar"}
 
     wants_booking = any(w in t for w in [
         "afspraak", "boeken", "inplannen", "planning", "wanneer", "beschikbaar",
@@ -468,7 +470,15 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
     intent = "afspraak_maken" if wants_booking else ("menselijke_overname" if human_request else "vraag_stellen")
     urgency = "hoog" if (urgent or negative or human_request) else "normaal"
 
-    if inactive:
+    if greeting_only:
+        intent = "begroeting"
+        urgency = "normaal"
+        requires_human = False
+        inactive = False
+        summary = "De klant begroet de assistent via SMS."
+        recommended = "Laat de AI vriendelijk begroeten en vragen waarmee de klant geholpen kan worden."
+        suggested = "Hallo! Waarmee kan ik u helpen?"
+    elif inactive:
         summary = "Het gesprek lijkt afgerond. Er is momenteel geen verdere actie nodig."
         recommended = "Geen actie nodig, tenzij de klant opnieuw reageert."
         suggested = "Graag gedaan. Laat gerust iets weten als ik nog kan helpen."
@@ -556,16 +566,16 @@ def normalize_money_for_sms(text: str) -> str:
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
-def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
+def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> bool:
     if not to_number or not message:
-        return
+        return False
         
     # ✅ Force SMS-safe money formatting for all tenants
     message = normalize_money_for_sms(message)
     
     if not SMSTOOLS_CLIENT_ID or not SMSTOOLS_CLIENT_SECRET:
         log("⚠️ Smstools credentials missing")
-        return
+        return False
 
     payload = {"message": message, "to": to_number, "sender": tenant["virtual_number"]}
     headers = {
@@ -579,10 +589,12 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> None:
         log(f"📤 Smstools send status={r.status_code}")
         if 200 <= r.status_code < 300:
             bump_monthly_outbound(tenant["tenant_id"], 1)
-        else:
-            log(f"⚠️ Smstools send failed: {r.text[:300]}")
+            return True
+        log(f"⚠️ Smstools send failed: {r.text[:300]}")
+        return False
     except Exception as e:
         log(f"⚠️ Smstools send error: {e}")
+        return False
 
 
 # =========================
@@ -1092,7 +1104,8 @@ def inbox_send_sms():
             return jsonify({"status": "error", "error": "Tenant niet gevonden."}), 404
         if not phone:
             return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
-        send_sms(tenant, phone, message)
+        if not send_sms(tenant, normalize_phone(phone), message):
+            return jsonify({"status": "error", "error": "SMSTools kon de SMS niet verzenden."}), 502
         msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms", sender_type="manual")
         # Elk manueel bericht vanuit Reactify betekent: ondernemer heeft overgenomen, AI blijft uit.
         set_conversation_status(conversation_id, tenant_id, "manual_overname", True)
