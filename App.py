@@ -398,11 +398,11 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                 cur.execute(
                     """
                     INSERT INTO conversations (id, tenant_id, contact_phone, contact_email, contact_name, channel, status, summary)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'ai-active', %s);
+                    VALUES (%s, %s, %s, %s, %s, %s, 'inactive', %s);
                     """,
                     (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
                 )
-                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "ai-active"}
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "inactive"}
     except Exception as e:
         log(f"⚠️ get_or_create_conversation failed: {e}")
         return None
@@ -645,7 +645,7 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 
 def is_ai_disabled_status(status: str) -> bool:
     s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
-    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "inactive", "closed")
+    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "closed")
 
 
 def set_conversation_status(conversation_id: str, tenant_id: str, status: str, requires_human: Optional[bool] = None) -> None:
