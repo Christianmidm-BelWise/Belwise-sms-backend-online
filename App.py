@@ -1174,6 +1174,24 @@ def conversations():
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
+                # Herstel een succesvolle afspraak altijd naar Afgerond. Dit vangt ook
+                # oudere/local Cal.com-syncs op waarbij samenvatting en actie al correct
+                # stonden, maar de status door een race condition nog 'ai-active' bleef.
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'afgesloten', requires_human = FALSE
+                    WHERE tenant_id = %s
+                      AND updated_at >= NOW() - INTERVAL '30 minutes'
+                      AND status NOT IN ('afgesloten', 'inactive')
+                      AND (
+                        LOWER(COALESCE(summary, '')) LIKE '%%afspraak%%succesvol%%ingepland%%'
+                        OR LOWER(COALESCE(recommended_action, '')) LIKE '%%gesprek%%afgerond%%'
+                      );
+                    """,
+                    (tenant["tenant_id"],),
+                )
+
                 # Elke chat wordt na 30 minuten zonder activiteit inactief, ook afgeronde chats.
                 cur.execute(
                     """
