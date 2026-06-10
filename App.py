@@ -334,14 +334,16 @@ def new_id(prefix: str) -> str:
 
 
 def get_default_tenant() -> Optional[Dict[str, Any]]:
-    # Prefer an explicit current tenant so old tenants/bots never leak into the platform.
+    # Prefer the explicitly configured tenant.
     if PREFERRED_TENANT_ID and PREFERRED_TENANT_ID in TENANTS_BY_ID:
         return TENANTS_BY_ID[PREFERRED_TENANT_ID]
-    # If there is only one tenant in tenants.csv, using it is safe.
+    # Reactify is the platform tenant used by the current dashboard.
+    if "reactify" in TENANTS_BY_ID:
+        return TENANTS_BY_ID["reactify"]
+    # Single-tenant installations remain automatic.
     if len(TENANTS_BY_ID) == 1:
         return next(iter(TENANTS_BY_ID.values()))
-    # With multiple tenants, do NOT silently pick the first one. This caused old bot contacts to appear.
-    log("⚠️ Multiple tenants found but REACTIFY_TENANT_ID/CURRENT_TENANT_ID/TENANT_ID is missing or invalid.")
+    log("⚠️ No default tenant could be selected. Set REACTIFY_TENANT_ID.")
     return None
 
 
@@ -963,6 +965,8 @@ def call_missed():
         if conv:
             add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "sms", sender_type="system")
             update_conversation_ai(conv["id"], classify_text_basic("Gemiste oproep. Klant verwacht terugkoppeling."))
+        else:
+            log(f"❌ /call/missed: SMS can be sent, but conversation could not be stored tenant={tenant.get('tenant_id')} caller={normalize_phone(caller)} db_available={db_available()}")
         send_sms(tenant, caller, opening)
         if conv:
             add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", opening, "sms", sender_type="ai")
