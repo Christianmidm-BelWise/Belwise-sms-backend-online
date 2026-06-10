@@ -601,6 +601,38 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> bool:
 # RETELL (simple)
 # =========================
 
+
+def get_contact_context(tenant_id: str, phone: str) -> Dict[str, str]:
+    context = {"customer_name": "", "customer_email": "", "has_known_contact_data": "false"}
+    if not db_available() or not tenant_id or not phone:
+        return context
+    try:
+        normalized = normalize_phone(phone)
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(contact_name, ''), COALESCE(contact_email, '')
+                    FROM conversations
+                    WHERE tenant_id = %s AND contact_phone = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """,
+                    (tenant_id, normalized),
+                )
+                row = cur.fetchone()
+        if row:
+            name = (row[0] or "").strip()
+            email = (row[1] or "").strip().lower()
+            if name and normalize_phone(name) != normalized:
+                context["customer_name"] = name
+            if email:
+                context["customer_email"] = email
+            context["has_known_contact_data"] = "true" if context["customer_name"] and context["customer_email"] else "false"
+    except Exception as exc:
+        log(f"⚠️ get_contact_context failed: {exc}")
+    return context
+
 def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
     key = (tenant["tenant_id"], phone)
     if key in SMS_SESSIONS:
@@ -613,7 +645,14 @@ def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
         r = requests.post(
             f"{RETELL_BASE_URL}/create-chat",
             headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
-            json={"agent_id": tenant["retell_agent_id"], "metadata": {"phone": phone}},
+            json={
+                "agent_id": tenant["retell_agent_id"],
+                "metadata": {"phone": normalize_phone(phone)},
+                "retell_llm_dynamic_variables": {
+                    **get_contact_context(tenant["tenant_id"], phone),
+                    "customer_phone": normalize_phone(phone),
+                },
+            },
             timeout=25,
         )
         data = r.json() if r.content else {}
