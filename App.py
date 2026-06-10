@@ -326,8 +326,11 @@ def get_default_tenant() -> Optional[Dict[str, Any]]:
     # Prefer an explicit current tenant so old tenants/bots never leak into the platform.
     if PREFERRED_TENANT_ID and PREFERRED_TENANT_ID in TENANTS_BY_ID:
         return TENANTS_BY_ID[PREFERRED_TENANT_ID]
-    if TENANTS_BY_ID:
+    # If there is only one tenant in tenants.csv, using it is safe.
+    if len(TENANTS_BY_ID) == 1:
         return next(iter(TENANTS_BY_ID.values()))
+    # With multiple tenants, do NOT silently pick the first one. This caused old bot contacts to appear.
+    log("⚠️ Multiple tenants found but REACTIFY_TENANT_ID/CURRENT_TENANT_ID/TENANT_ID is missing or invalid.")
     return None
 
 
@@ -805,6 +808,7 @@ def call_missed():
 
 
 
+
 @app.route("/conversations", methods=["GET", "PATCH", "POST", "DELETE"])
 def conversations():
     tenant = get_tenant_from_request_or_default()
@@ -812,90 +816,44 @@ def conversations():
         return jsonify({"status": "success", "data": []}), 200
     try:
         ensure_conversation_tables()
-        tenant_id = tenant["tenant_id"]
 
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
-            conversation_id = (
-                body.get("conversationId") or body.get("conversation_id")
-                or request.args.get("conversationId") or request.args.get("conversation_id")
-                or request.args.get("id") or ""
-            ).strip()
+            conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
             phone = normalize_phone(body.get("phone") or body.get("contact_phone") or request.args.get("phone") or request.args.get("contact_phone") or "")
             email = (body.get("email") or body.get("contact_email") or request.args.get("email") or request.args.get("contact_email") or "").strip().lower()
-
             if not conversation_id and not phone and not email:
                 return jsonify({"status": "error", "error": "conversationId, telefoon of e-mail ontbreekt."}), 400
-
+            deleted_ids = []
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
                     if conversation_id:
-                        cur.execute(
-                            "DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;",
-                            (conversation_id, tenant_id),
-                        )
-                    else:
-                        clauses = []
-                        params = []
-                        if phone:
-                            clauses.append("contact_phone = %s")
-                            params.append(phone)
-                        if email:
-                            clauses.append("LOWER(contact_email) = %s")
-                            params.append(email)
-                        params.append(tenant_id)
-                        cur.execute(
-                            f"DELETE FROM conversations WHERE ({' OR '.join(clauses)}) AND tenant_id = %s RETURNING id;",
-                            tuple(params),
-                        )
-                    deleted = [r[0] for r in cur.fetchall()]
+                        cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
+                        deleted_ids.extend([r[0] for r in cur.fetchall()])
+                    if phone:
+                        cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND contact_phone = %s RETURNING id;", (tenant["tenant_id"], phone))
+                        deleted_ids.extend([r[0] for r in cur.fetchall()])
+                    if email:
+                        cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND LOWER(COALESCE(contact_email,'')) = %s RETURNING id;", (tenant["tenant_id"], email))
+                        deleted_ids.extend([r[0] for r in cur.fetchall()])
+            return jsonify({"status": "success", "data": {"deleted": True, "ids": list(dict.fromkeys(deleted_ids))}}), 200
 
-            return jsonify({"status": "success", "data": {"deleted": True, "ids": deleted}}), 200
-
-        if request.method == "POST":
-            body = request.get_json(force=True, silent=True) or {}
-            conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
-            status = (body.get("status") or body.get("conversationStatus") or "").strip()
-
-            # POST zonder conversationId = nieuw gesprek/contact aanmaken vanuit Reactify.
-            if not conversation_id:
-                phone = body.get("phone") or body.get("contact_phone") or body.get("to") or body.get("to_number") or ""
-                email = body.get("email") or body.get("contact_email") or ""
-                name = body.get("name") or body.get("contact_name") or body.get("contactName") or ""
-                channel = body.get("channel") or "sms"
-                if not phone and not email:
-                    return jsonify({"status": "error", "error": "Telefoonnummer of e-mail ontbreekt voor nieuw gesprek."}), 400
-                conv = get_or_create_conversation(tenant, phone=phone, name=name, email=email, channel=channel)
-                if not conv:
-                    return jsonify({"status": "error", "error": "Gesprek kon niet worden aangemaakt."}), 500
-                # Zorg dat manueel aangemaakte gesprekken bij start niet door Retell worden overgenomen.
-                if body.get("manualTakeover") or body.get("aiEnabled") is False:
-                    set_conversation_status(conv["id"], tenant_id, "menselijke_overname", True)
-                    conv["status"] = "menselijke_overname"
-                return jsonify({"status": "success", "data": {
-                    "id": conv["id"],
-                    "tenant_id": tenant_id,
-                    "contact_phone": conv.get("contact_phone", normalize_phone(phone)),
-                    "contact_email": conv.get("contact_email", email or ""),
-                    "contact_name": conv.get("contact_name", name or phone or email or "Klant"),
-                    "channel": channel,
-                    "status": conv.get("status", "ai-active"),
-                }}), 200
-
-            if not status:
-                ai_enabled = body.get("aiEnabled")
-                if ai_enabled is not None:
-                    status = "ai-active" if bool(ai_enabled) else "menselijke_overname"
-            if not status:
-                return jsonify({"status": "error", "error": "status ontbreekt."}), 400
-            requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
-            set_conversation_status(conversation_id, tenant_id, status, requires_human)
-            return jsonify({"status": "success", "data": {"id": conversation_id, "status": status, "aiEnabled": not requires_human}}), 200
-
-        if request.method == "PATCH":
+        if request.method in ("PATCH", "POST"):
             body = request.get_json(force=True, silent=True) or {}
             conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
             status = (body.get("status") or body.get("conversationStatus") or "").strip()
+            phone = body.get("phone") or body.get("contact_phone") or body.get("to") or ""
+            name = body.get("name") or body.get("contact_name") or body.get("customerName") or ""
+            email = body.get("email") or body.get("contact_email") or body.get("customerEmail") or ""
+            channel = body.get("channel") or "sms"
+
+            # POST zonder status = nieuw gesprek/contact aanmaken vanuit Reactify.
+            if request.method == "POST" and not status and (phone or email or name):
+                conv = get_or_create_conversation(tenant, phone=phone, name=name, email=email, channel=channel)
+                if not conv:
+                    return jsonify({"status": "error", "error": "Kon gesprek niet aanmaken."}), 500
+                return jsonify({"status": "success", "data": conv}), 200
+
             ai_enabled = body.get("aiEnabled")
             if ai_enabled is not None and not status:
                 status = "ai-active" if bool(ai_enabled) else "menselijke_overname"
@@ -904,7 +862,7 @@ def conversations():
             if not status:
                 return jsonify({"status": "error", "error": "status ontbreekt."}), 400
             requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
-            set_conversation_status(conversation_id, tenant_id, status, requires_human)
+            set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
             return jsonify({"status": "success", "data": {"id": conversation_id, "status": status, "aiEnabled": not requires_human}}), 200
 
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
@@ -925,7 +883,7 @@ def conversations():
                     ORDER BY c.updated_at DESC
                     LIMIT %s;
                     """,
-                    (tenant_id, limit),
+                    (tenant["tenant_id"], limit),
                 )
                 rows = cur.fetchall()
         data = []
@@ -978,54 +936,36 @@ def conversation_messages():
 
 
 @app.route("/send-sms", methods=["POST"])
+
 def inbox_send_sms():
     body = request.get_json(force=True, silent=True) or {}
-    tenant = get_tenant_from_request_or_default()
     conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
     message = (body.get("message") or body.get("text") or "").strip()
+    if not conversation_id:
+        return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
     if not message:
         return jsonify({"status": "error", "error": "Bericht ontbreekt."}), 400
-    if not tenant:
-        return jsonify({"status": "error", "error": "Tenant niet gevonden."}), 404
     if not db_available():
         return jsonify({"status": "error", "error": "DATABASE_URL ontbreekt."}), 500
-
     try:
         ensure_conversation_tables()
-        tenant_id = tenant["tenant_id"]
-
-        # Nieuw lokaal contact vanuit Reactify mag ook direct sms'en zonder bestaand backendgesprek.
-        if not conversation_id:
-            phone = body.get("phone") or body.get("contact_phone") or body.get("to") or body.get("to_number") or ""
-            email = body.get("email") or body.get("contact_email") or ""
-            name = body.get("name") or body.get("contact_name") or body.get("contactName") or ""
-            if not phone:
-                return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan deze klant."}), 400
-            conv = get_or_create_conversation(tenant, phone=phone, name=name, email=email, channel="sms")
-            if not conv:
-                return jsonify({"status": "error", "error": "Gesprek kon niet worden aangemaakt."}), 500
-            conversation_id = conv["id"]
-            phone = conv.get("contact_phone") or normalize_phone(phone)
-        else:
-            with psycopg2.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT tenant_id, contact_phone FROM conversations WHERE id = %s AND tenant_id = %s LIMIT 1;",
-                        (conversation_id, tenant_id),
-                    )
-                    row = cur.fetchone()
-            if not row:
-                return jsonify({"status": "error", "error": "Gesprek niet gevonden voor huidige tenant."}), 404
-            tenant_id, phone = row
-
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT tenant_id, contact_phone FROM conversations WHERE id = %s LIMIT 1;", (conversation_id,))
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
+        tenant_id, phone = row
+        tenant = TENANTS_BY_ID.get(tenant_id)
+        if not tenant:
+            return jsonify({"status": "error", "error": "Tenant niet gevonden."}), 404
         if not phone:
             return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
-
         send_sms(tenant, phone, message)
         msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms")
         # Elk manueel bericht vanuit Reactify betekent: ondernemer heeft overgenomen, AI blijft uit.
         set_conversation_status(conversation_id, tenant_id, "menselijke_overname", True)
-        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "backendId": conversation_id, "status": "menselijke_overname", "aiEnabled": False}}), 200
+        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "status": "menselijke_overname", "aiEnabled": False}}), 200
     except Exception as e:
         log(f"❌ /send-sms error: {e}")
         return jsonify({"status": "error", "error": "SMS verzenden mislukt.", "details": str(e)}), 500
