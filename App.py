@@ -398,11 +398,11 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                 cur.execute(
                     """
                     INSERT INTO conversations (id, tenant_id, contact_phone, contact_email, contact_name, channel, status, summary)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'inactive', %s);
+                    VALUES (%s, %s, %s, %s, %s, %s, 'ai-active', %s);
                     """,
                     (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
                 )
-                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "inactive"}
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "ai-active"}
     except Exception as e:
         log(f"⚠️ get_or_create_conversation failed: {e}")
         return None
@@ -645,7 +645,7 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 
 def is_ai_disabled_status(status: str) -> bool:
     s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
-    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "closed")
+    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "inactive", "closed")
 
 
 def set_conversation_status(conversation_id: str, tenant_id: str, status: str, requires_human: Optional[bool] = None) -> None:
@@ -867,7 +867,7 @@ def conversations():
 
             ai_enabled = body.get("aiEnabled")
             if ai_enabled is not None and not status:
-                status = "ai-active" if bool(ai_enabled) else "menselijke_overname"
+                status = "ai-active" if bool(ai_enabled) else "manual_overname"
             if not conversation_id:
                 return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
             if not status:
@@ -975,8 +975,8 @@ def inbox_send_sms():
         send_sms(tenant, phone, message)
         msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms", sender_type="manual")
         # Elk manueel bericht vanuit Reactify betekent: ondernemer heeft overgenomen, AI blijft uit.
-        set_conversation_status(conversation_id, tenant_id, "menselijke_overname", True)
-        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "status": "menselijke_overname", "aiEnabled": False}}), 200
+        set_conversation_status(conversation_id, tenant_id, "manual_overname", True)
+        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "status": "manual_overname", "aiEnabled": False}}), 200
     except Exception as e:
         log(f"❌ /send-sms error: {e}")
         return jsonify({"status": "error", "error": "SMS verzenden mislukt.", "details": str(e)}), 500
