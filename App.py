@@ -76,11 +76,17 @@ def month_key(dt: Optional[datetime] = None) -> str:
 
 def normalize_phone(raw: str) -> str:
     s = re.sub(r"\D+", "", (raw or "").strip())
+    if not s:
+        return ""
     if s.startswith("0032"):
-        s = "32" + s[4:]
-    if s.startswith("0") and len(s) in (9, 10):
-        s = "32" + s[1:]
-    return s
+        s = s[2:]
+    if s.startswith("32"):
+        return "+32" + s[2:]
+    if s.startswith("0"):
+        return "+32" + s[1:]
+    if len(s) == 9 and s.startswith("4"):
+        return "+32" + s
+    return "+" + s if raw.strip().startswith("+") else s
 
 
 def detect_csv_delimiter(path: str) -> str:
@@ -302,6 +308,7 @@ def ensure_conversation_tables() -> None:
                       channel TEXT NOT NULL DEFAULT 'sms',
                       body TEXT NOT NULL,
                       external_id TEXT,
+                      sender_type TEXT NOT NULL DEFAULT 'unknown',
                       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
 
@@ -309,6 +316,10 @@ def ensure_conversation_tables() -> None:
                       ON conversations (tenant_id, updated_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_conversations_phone
                       ON conversations (tenant_id, contact_phone);
+                    ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS sender_type TEXT NOT NULL DEFAULT 'unknown';
+                    UPDATE conversation_messages SET sender_type = CASE WHEN direction = 'incoming' THEN 'customer' ELSE 'unknown' END WHERE sender_type IS NULL OR sender_type = '';
+                    UPDATE conversations SET contact_phone = CASE WHEN contact_phone ~ '^32' THEN '+' || contact_phone WHEN contact_phone ~ '^0' THEN '+32' || SUBSTRING(contact_phone FROM 2) ELSE contact_phone END WHERE contact_phone IS NOT NULL AND contact_phone <> '';
+
                     CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
                       ON conversation_messages (conversation_id, created_at ASC);
                     """
@@ -397,7 +408,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
         return None
 
 
-def add_conversation_message(conversation_id: str, tenant_id: str, direction: str, body: str, channel: str = "sms", external_id: str = "") -> Optional[str]:
+def add_conversation_message(conversation_id: str, tenant_id: str, direction: str, body: str, channel: str = "sms", external_id: str = "", sender_type: str = "unknown") -> Optional[str]:
     if not db_available() or not conversation_id or not body:
         return None
     try:
@@ -407,10 +418,10 @@ def add_conversation_message(conversation_id: str, tenant_id: str, direction: st
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversation_messages (id, conversation_id, tenant_id, direction, channel, body, external_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    INSERT INTO conversation_messages (id, conversation_id, tenant_id, direction, channel, body, external_id, sender_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
                     """,
-                    (msg_id, conversation_id, tenant_id, direction, channel or "sms", body, external_id or ""),
+                    (msg_id, conversation_id, tenant_id, direction, channel or "sms", body, external_id or "", sender_type or "unknown"),
                 )
                 cur.execute("UPDATE conversations SET updated_at = NOW() WHERE id = %s;", (conversation_id,))
         return msg_id
@@ -752,7 +763,7 @@ def sms_inbound():
         current_status = (conv or {}).get("status") or "ai-active"
 
         if conv:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms")
+            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms", sender_type="customer")
             # Als de ondernemer al heeft overgenomen, blijft AI uit.
             # Als de klant expliciet menselijke hulp nodig heeft, schakelen we AI meteen uit.
             if is_ai_disabled_status(current_status):
@@ -769,7 +780,7 @@ def sms_inbound():
         send_sms(tenant, sender, reply)
 
         if conv and reply:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms")
+            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms", sender_type="ai")
             # Status blijft AI actief, tenzij er ondertussen menselijke overname nodig was.
             if not analysis.get("requiresHuman"):
                 set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
@@ -797,11 +808,11 @@ def call_missed():
         opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
         conv = get_or_create_conversation(tenant, phone=caller, channel="missed_call")
         if conv:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "missed_call")
+            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "missed_call", sender_type="system")
             update_conversation_ai(conv["id"], classify_text_basic("Gemiste oproep. Klant verwacht terugkoppeling."))
         send_sms(tenant, caller, opening)
         if conv:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", opening, "sms")
+            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", opening, "sms", sender_type="ai")
 
     return "OK", 200
 
@@ -916,7 +927,7 @@ def conversation_messages():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT m.id, m.conversation_id, m.tenant_id, m.direction, m.channel, m.body, m.external_id, m.created_at
+                    SELECT m.id, m.conversation_id, m.tenant_id, m.direction, m.channel, m.body, m.external_id, m.created_at, m.sender_type
                     FROM conversation_messages m
                     INNER JOIN conversations c ON c.id = m.conversation_id AND c.tenant_id = m.tenant_id
                     WHERE m.conversation_id = %s AND c.tenant_id = %s
@@ -927,7 +938,7 @@ def conversation_messages():
                 rows = cur.fetchall()
         data = [{
             "id": r[0], "conversation_id": r[1], "tenant_id": r[2], "direction": r[3], "channel": r[4],
-            "body": r[5], "text": r[5], "external_id": r[6] or "", "created_at": r[7].isoformat() if r[7] else None,
+            "body": r[5], "text": r[5], "external_id": r[6] or "", "created_at": r[7].isoformat() if r[7] else None, "sender_type": r[8] or ("customer" if r[3] == "incoming" else "unknown"),
         } for r in rows]
         return jsonify({"status": "success", "data": data}), 200
     except Exception as e:
@@ -962,7 +973,7 @@ def inbox_send_sms():
         if not phone:
             return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
         send_sms(tenant, phone, message)
-        msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms")
+        msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms", sender_type="manual")
         # Elk manueel bericht vanuit Reactify betekent: ondernemer heeft overgenomen, AI blijft uit.
         set_conversation_status(conversation_id, tenant_id, "menselijke_overname", True)
         return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "status": "menselijke_overname", "aiEnabled": False}}), 200
