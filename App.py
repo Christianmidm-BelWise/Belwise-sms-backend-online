@@ -870,11 +870,29 @@ def conversations():
                 status = "ai-active" if bool(ai_enabled) else "manual_overname"
             if not conversation_id:
                 return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
-            if not status:
-                return jsonify({"status": "error", "error": "status ontbreekt."}), 400
-            requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
-            set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
-            return jsonify({"status": "success", "data": {"id": conversation_id, "status": status, "aiEnabled": not requires_human}}), 200
+
+            normalized_phone = normalize_phone(phone) if phone else ""
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE conversations
+                        SET contact_name = COALESCE(NULLIF(%s, ''), contact_name),
+                            contact_email = COALESCE(NULLIF(%s, ''), contact_email),
+                            contact_phone = COALESCE(NULLIF(%s, ''), contact_phone),
+                            updated_at = NOW()
+                        WHERE id = %s AND tenant_id = %s;
+                        """,
+                        (name.strip(), email.strip().lower(), normalized_phone, conversation_id, tenant["tenant_id"]),
+                    )
+
+            if status:
+                requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
+                set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
+            else:
+                requires_human = None
+
+            return jsonify({"status": "success", "data": {"id": conversation_id, "status": status or None, "aiEnabled": None if requires_human is None else not requires_human}}), 200
 
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
