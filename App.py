@@ -466,7 +466,7 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
 
     requires_human = bool(urgent or negative or human_request)
     intent = "afspraak_maken" if wants_booking else ("menselijke_overname" if human_request else "vraag_stellen")
-    urgency = "hoog" if urgent else ("medium" if (negative or human_request) else "normaal")
+    urgency = "hoog" if (urgent or negative or human_request) else "normaal"
 
     if inactive:
         summary = "Het gesprek lijkt afgerond. Er is momenteel geen verdere actie nodig."
@@ -645,8 +645,94 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 
 def is_ai_disabled_status(status: str) -> bool:
     s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
-    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "inactive", "closed")
+    return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "closed")
 
+
+
+def get_recent_conversation_messages(conversation_id: str, limit: int = 12) -> list:
+    if not db_available() or not conversation_id:
+        return []
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT direction, body, sender_type, created_at
+                    FROM conversation_messages
+                    WHERE conversation_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                    """,
+                    (conversation_id, int(limit)),
+                )
+                rows = cur.fetchall()
+        return [
+            {"direction": r[0], "body": r[1] or "", "sender_type": r[2] or "unknown", "created_at": r[3]}
+            for r in reversed(rows)
+        ]
+    except Exception as e:
+        log(f"⚠️ get_recent_conversation_messages failed: {e}")
+        return []
+
+
+def normalize_reply_for_compare(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def detect_ai_stall(conversation_id: str, proposed_reply: str) -> Optional[str]:
+    """Detecteer herhaling of een gesprek dat niet vooruitgaat."""
+    reply_key = normalize_reply_for_compare(proposed_reply)
+    if not reply_key:
+        return "De AI gaf geen bruikbaar antwoord."
+
+    history = get_recent_conversation_messages(conversation_id, 14)
+    ai_messages = [m for m in history if m.get("direction") == "outgoing" and m.get("sender_type") == "ai"]
+    recent_keys = [normalize_reply_for_compare(m.get("body", "")) for m in ai_messages[-4:]]
+
+    if reply_key in recent_keys:
+        return "De AI herhaalt hetzelfde antwoord."
+
+    # Dezelfde of vrijwel dezelfde vraag meerdere keren is een sterke aanwijzing dat de flow vastloopt.
+    question_stems = []
+    for m in ai_messages[-5:]:
+        body = normalize_reply_for_compare(m.get("body", ""))
+        if "?" in (m.get("body") or "") or any(x in body for x in ["ben je", "bent u", "welke dag", "welk uur", "wat kan ik"]):
+            question_stems.append(body[:90])
+    if len(question_stems) >= 2 and reply_key[:90] in question_stems:
+        return "De AI stelt opnieuw dezelfde vraag en de conversatie gaat niet vooruit."
+
+    return None
+
+
+def mark_ai_takeover_needed(conversation_id: str, tenant_id: str, reason: str) -> None:
+    if not db_available() or not conversation_id:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'menselijke_overname',
+                        requires_human = TRUE,
+                        urgency = 'hoog',
+                        intent = 'menselijke_overname',
+                        summary = %s,
+                        recommended_action = %s,
+                        suggested_reply = %s,
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s;
+                    """,
+                    (
+                        reason,
+                        "Neem het gesprek over, controleer wat al gevraagd is en antwoord persoonlijk.",
+                        "Dag, ik neem dit gesprek even persoonlijk over zodat ik u correct kan verderhelpen.",
+                        conversation_id,
+                        tenant_id,
+                    ),
+                )
+    except Exception as e:
+        log(f"⚠️ mark_ai_takeover_needed failed: {e}")
 
 def set_conversation_status(conversation_id: str, tenant_id: str, status: str, requires_human: Optional[bool] = None) -> None:
     if not db_available() or not conversation_id:
@@ -764,26 +850,42 @@ def sms_inbound():
 
         if conv:
             add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms", sender_type="customer")
-            # Als de ondernemer al heeft overgenomen, blijft AI uit.
-            # Als de klant expliciet menselijke hulp nodig heeft, schakelen we AI meteen uit.
+            # Bouw samenvatting, urgentie en aanbevolen actie op uit de recente conversatie,
+            # niet alleen uit het allerlaatste bericht.
+            recent = get_recent_conversation_messages(conv["id"], 16)
+            conversation_text = " ".join(m.get("body", "") for m in recent if m.get("body"))
+            analysis = classify_text_basic(conversation_text or text)
+
+            # Alleen een echte handmatige overname, expliciete overnamevraag of afgesloten gesprek blokkeert AI.
+            # 'inactive' betekent enkel dat er nog geen activiteit was en mag een eerste antwoord nooit blokkeren.
             if is_ai_disabled_status(current_status):
                 set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
                 log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
                 return "OK", 200
+
+            # Zodra een klant bericht en AI aan staat, is het gesprek actief.
             update_conversation_ai(conv["id"], analysis)
             if analysis.get("requiresHuman"):
                 set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
                 log(f"🤝 Human takeover required for conversation={conv['id']}; Retell skipped")
                 return "OK", 200
+            set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
 
         reply = ask_retell_via_sms(tenant, sender, text)
-        send_sms(tenant, sender, reply)
+
+        if conv:
+            stall_reason = detect_ai_stall(conv["id"], reply)
+            if stall_reason:
+                mark_ai_takeover_needed(conv["id"], tenant["tenant_id"], stall_reason)
+                log(f"⚠️ AI stall detected conversation={conv['id']}: {stall_reason}")
+                return "OK", 200
+
+        if reply:
+            send_sms(tenant, sender, reply)
 
         if conv and reply:
             add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms", sender_type="ai")
-            # Status blijft AI actief, tenzij er ondertussen menselijke overname nodig was.
-            if not analysis.get("requiresHuman"):
-                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
+            set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
 
     return "OK", 200
 
