@@ -924,6 +924,30 @@ def mark_conversation_completed(conversation_id: str, tenant_id: str) -> None:
     except Exception as exc:
         log(f"⚠️ mark_conversation_completed failed: {exc}")
 
+def mark_conversation_resolved(conversation_id: str, tenant_id: str) -> None:
+    """Mark a manually handled conversation as completed."""
+    if not db_available() or not conversation_id:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'afgesloten', requires_human = FALSE,
+                        urgency = 'normaal',
+                        summary = 'De klant is geholpen en het gesprek is afgerond.',
+                        recommended_action = 'Geen verdere actie nodig. Het gesprek is afgerond.',
+                        suggested_reply = '',
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s;
+                    """,
+                    (conversation_id, tenant_id),
+                )
+    except Exception as exc:
+        log(f"⚠️ mark_conversation_resolved failed: {exc}")
+
+
 def is_ai_disabled_status(status: str) -> bool:
     s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
     return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "closed")
@@ -1143,8 +1167,18 @@ def sms_inbound():
             # Alleen een echte handmatige overname, expliciete overnamevraag of afgesloten gesprek blokkeert AI.
             # 'inactive' betekent enkel dat er nog geen activiteit was en mag een eerste antwoord nooit blokkeren.
             if is_ai_disabled_status(current_status):
-                set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
-                log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
+                # Bij een handmatig overgenomen gesprek blijft Retell uit. Een duidelijke
+                # afsluitende reactie van de klant (bv. "bedankt", "in orde") rondt
+                # het gesprek wel af en werkt samenvatting + aanbevolen actie bij.
+                latest_analysis = classify_text_basic(text)
+                normalized_status = str(current_status or "").lower().replace("-", "_").replace(" ", "_")
+                if latest_analysis.get("inactive") and normalized_status not in ("afgesloten", "closed"):
+                    mark_conversation_resolved(conv["id"], tenant["tenant_id"])
+                    end_retell_chat(tenant, sender)
+                    log(f"✅ Manually handled conversation completed by customer closing message conversation={conv['id']}")
+                else:
+                    set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
+                    log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
                 return "OK", 200
 
             # Zodra een klant bericht en AI aan staat, is het gesprek actief.
@@ -1282,8 +1316,20 @@ def conversations():
                     )
 
             if status:
-                requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
-                set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
+                normalized_status = status.strip().lower().replace("-", "_").replace(" ", "_")
+                if normalized_status in ("afgesloten", "closed", "completed", "inactive", "inactief", "ai_active", "ai_actief"):
+                    requires_human = False
+                else:
+                    requires_human = normalized_status in (
+                        "menselijke_overname", "human_required", "human_needed", "overname_nodig",
+                        "manual_overname", "manual_takeover", "overgenomen", "taken_over"
+                    )
+                if normalized_status in ("afgesloten", "closed", "completed"):
+                    mark_conversation_resolved(conversation_id, tenant["tenant_id"])
+                    status = "afgesloten"
+                    requires_human = False
+                else:
+                    set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
             else:
                 requires_human = None
 
