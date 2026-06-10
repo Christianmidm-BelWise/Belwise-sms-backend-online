@@ -402,7 +402,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     """,
                     (conv_id, tenant_id, normalized_phone, email or "", display_name, channel or "sms", "Nieuw gesprek aangemaakt via Reactify."),
                 )
-                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "ai-active"}
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": email, "channel": channel, "status": "inactive"}
     except Exception as e:
         log(f"⚠️ get_or_create_conversation failed: {e}")
         return None
