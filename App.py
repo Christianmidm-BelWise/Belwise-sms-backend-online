@@ -2,7 +2,7 @@ import os
 import re
 import csv
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -384,7 +384,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                 if normalized_phone:
                     cur.execute(
                         """
-                        SELECT id, status FROM conversations
+                        SELECT id, status, updated_at FROM conversations
                         WHERE tenant_id = %s AND contact_phone = %s
                         ORDER BY updated_at DESC
                         LIMIT 1;
@@ -395,6 +395,10 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                 if existing:
                     conv_id = existing[0]
                     existing_status = existing[1] if len(existing) > 1 else 'ai-active'
+                    existing_updated_at = existing[2] if len(existing) > 2 else None
+                    if existing_updated_at and datetime.now(timezone.utc) - existing_updated_at > timedelta(minutes=30):
+                        existing_status = 'inactive'
+                        cur.execute("UPDATE conversations SET status = 'inactive', requires_human = FALSE WHERE id = %s;", (conv_id,))
                     cur.execute(
                         """
                         UPDATE conversations
@@ -708,6 +712,100 @@ def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
 
 
 
+
+def extract_contact_details(text: str) -> Dict[str, str]:
+    """Haal een bruikbare naam en e-mail uit een SMS zonder bestaande gegevens te overschrijven met ruis."""
+    raw = (text or "").strip()
+    result = {"name": "", "email": ""}
+    if not raw:
+        return result
+
+    email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", raw, flags=re.IGNORECASE)
+    if email_match:
+        result["email"] = email_match.group(0).lower()
+        remainder = (raw[:email_match.start()] + " " + raw[email_match.end():]).strip()
+        remainder = re.sub(r"\b(en|and|naam|mijn naam is|ik ben|email|e-mail|mail)\b", " ", remainder, flags=re.IGNORECASE)
+        remainder = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' -]+", " ", remainder)
+        remainder = re.sub(r"\s+", " ", remainder).strip(" -,")
+        words = [w for w in remainder.split() if len(w) > 1]
+        if 2 <= len(words) <= 6:
+            result["name"] = " ".join(words).title()
+    return result
+
+
+def update_conversation_contact(conversation_id: str, tenant_id: str, name: str = "", email: str = "") -> None:
+    if not db_available() or not conversation_id or (not name and not email):
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET contact_name = COALESCE(NULLIF(%s, ''), contact_name),
+                        contact_email = COALESCE(NULLIF(%s, ''), contact_email),
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s;
+                    """,
+                    ((name or "").strip(), (email or "").strip().lower(), conversation_id, tenant_id),
+                )
+    except Exception as exc:
+        log(f"⚠️ update_conversation_contact failed: {exc}")
+
+
+def reply_confirms_booking(text: str) -> bool:
+    t = normalize_reply_for_compare(text)
+    return any(phrase in t for phrase in [
+        "ik heb het ingepland", "afspraak is ingepland", "afspraak werd ingepland",
+        "je bent ingeschreven", "u bent ingeschreven", "bevestiging via e mail",
+        "bevestiging per e mail", "afspraak is geboekt", "ik heb de afspraak geboekt"
+    ])
+
+
+def end_retell_chat(tenant: Dict[str, Any], phone: str) -> bool:
+    key = (tenant["tenant_id"], phone)
+    chat_id = SMS_SESSIONS.get(key)
+    if not chat_id or not RETELL_API_KEY:
+        SMS_SESSIONS.pop(key, None)
+        return False
+    try:
+        response = requests.patch(
+            f"{RETELL_BASE_URL}/end-chat/{chat_id}",
+            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
+            timeout=20,
+        )
+        ok = 200 <= response.status_code < 300
+        if not ok:
+            log(f"⚠️ Retell end-chat failed status={response.status_code} body={response.text[:250]}")
+        return ok
+    except Exception as exc:
+        log(f"⚠️ Retell end-chat error: {exc}")
+        return False
+    finally:
+        SMS_SESSIONS.pop(key, None)
+
+
+def mark_conversation_completed(conversation_id: str, tenant_id: str) -> None:
+    if not db_available() or not conversation_id:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'afgesloten', requires_human = FALSE,
+                        intent = 'afspraak_maken', urgency = 'normaal',
+                        summary = 'De afspraak is succesvol ingepland.',
+                        recommended_action = 'Geen verdere actie nodig. Het gesprek is afgerond.',
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s;
+                    """,
+                    (conversation_id, tenant_id),
+                )
+    except Exception as exc:
+        log(f"⚠️ mark_conversation_completed failed: {exc}")
+
 def is_ai_disabled_status(status: str) -> bool:
     s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
     return s in ("menselijke_overname", "human_required", "human_needed", "manual_takeover", "manual_overname", "ai_paused", "afgesloten", "closed")
@@ -915,6 +1013,9 @@ def sms_inbound():
 
         if conv:
             add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms", sender_type="customer")
+            details = extract_contact_details(text)
+            if details.get("name") or details.get("email"):
+                update_conversation_contact(conv["id"], tenant["tenant_id"], details.get("name", ""), details.get("email", ""))
             # Bouw samenvatting, urgentie en aanbevolen actie op uit de recente conversatie,
             # niet alleen uit het allerlaatste bericht.
             recent = get_recent_conversation_messages(conv["id"], 16)
@@ -950,7 +1051,12 @@ def sms_inbound():
 
         if conv and reply:
             add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms", sender_type="ai")
-            set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
+            if reply_confirms_booking(reply):
+                mark_conversation_completed(conv["id"], tenant["tenant_id"])
+                end_retell_chat(tenant, sender)
+                log(f"✅ Booking confirmed; conversation completed and Retell chat ended conversation={conv['id']}")
+            else:
+                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
 
     return "OK", 200
 
@@ -1068,6 +1174,16 @@ def conversations():
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
+                # Elke chat wordt na 30 minuten zonder activiteit inactief, ook afgeronde chats.
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'inactive', requires_human = FALSE
+                    WHERE tenant_id = %s AND updated_at < NOW() - INTERVAL '30 minutes'
+                      AND status <> 'inactive';
+                    """,
+                    (tenant["tenant_id"],),
+                )
                 base_query = """
                     SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
                            c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
