@@ -1183,10 +1183,29 @@ def conversations():
                     SET status = 'afgesloten', requires_human = FALSE
                     WHERE tenant_id = %s
                       AND updated_at >= NOW() - INTERVAL '30 minutes'
-                      AND status NOT IN ('afgesloten', 'inactive')
+                      AND status NOT IN ('afgesloten', 'inactive', 'manual_overname', 'manual_takeover', 'overgenomen', 'taken_over', 'menselijke_overname', 'human_required', 'human_needed', 'overname_nodig')
                       AND (
                         LOWER(COALESCE(summary, '')) LIKE '%%afspraak%%succesvol%%ingepland%%'
                         OR LOWER(COALESCE(recommended_action, '')) LIKE '%%gesprek%%afgerond%%'
+                      );
+                    """,
+                    (tenant["tenant_id"],),
+                )
+
+                # Herstel inconsistente overnamestatussen. Wanneer de analyse menselijke
+                # opvolging vereist of expliciet adviseert het gesprek over te nemen, mag
+                # de zichtbare status nooit op AI actief blijven staan.
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET status = 'menselijke_overname', requires_human = TRUE
+                    WHERE tenant_id = %s
+                      AND status IN ('ai-active', 'ai_active', 'ai-actief', 'ai_actief', 'inactive')
+                      AND (
+                        requires_human = TRUE
+                        OR LOWER(COALESCE(recommended_action, '')) LIKE '%%neem%%gesprek%%over%%'
+                        OR LOWER(COALESCE(summary, '')) LIKE '%%menselijke opvolging%%'
+                        OR LOWER(COALESCE(summary, '')) LIKE '%%medewerker%%'
                       );
                     """,
                     (tenant["tenant_id"],),
