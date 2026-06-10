@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import uuid
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
 
@@ -52,6 +53,12 @@ def _log_request() -> None:
         log(f"➡️ {request.method} {request.path} qs={request.query_string.decode('utf-8', 'ignore')}")
     except Exception:
         pass
+
+
+@app.before_request
+def _privacy_cleanup_tick() -> None:
+    if request.path not in ("/health",):
+        run_retention_cleanup(force=False)
 
 
 def sanitize_database_url(raw: str) -> str:
@@ -268,6 +275,117 @@ def bump_monthly_outbound(tenant_id: str, amount: int = 1) -> None:
 
 
 
+
+# =========================
+# PRIVACY / DATA RETENTION
+# =========================
+
+_RETENTION_LAST_RUN: Optional[datetime] = None
+
+
+def ensure_privacy_settings_table() -> None:
+    if not db_available():
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tenant_privacy_settings (
+                      tenant_id TEXT PRIMARY KEY,
+                      retention_days INT NOT NULL DEFAULT 90 CHECK (retention_days IN (60, 90)),
+                      profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+    except Exception as exc:
+        log(f"⚠️ ensure_privacy_settings_table failed: {exc}")
+
+
+def run_retention_cleanup(force: bool = False) -> int:
+    global _RETENTION_LAST_RUN
+    if not db_available():
+        return 0
+    now = datetime.now(timezone.utc)
+    if not force and _RETENTION_LAST_RUN and now - _RETENTION_LAST_RUN < timedelta(minutes=15):
+        return 0
+    _RETENTION_LAST_RUN = now
+    ensure_privacy_settings_table()
+    ensure_conversation_tables()
+    deleted = 0
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM conversations c
+                    USING tenant_privacy_settings s
+                    WHERE c.tenant_id = s.tenant_id
+                      AND c.updated_at < NOW() - (s.retention_days * INTERVAL '1 day')
+                    RETURNING c.id;
+                """)
+                deleted = len(cur.fetchall())
+        if deleted:
+            log(f"🧹 Privacy cleanup removed {deleted} conversations")
+    except Exception as exc:
+        log(f"⚠️ retention cleanup failed: {exc}")
+    return deleted
+
+
+@app.route("/privacy-settings", methods=["GET", "PATCH", "POST", "DELETE"])
+def privacy_settings():
+    tenant = get_tenant_from_request_or_default()
+    if not tenant:
+        return jsonify({"status": "error", "error": "Geen platformtenant geselecteerd."}), 400
+    if not db_available():
+        return jsonify({"status": "error", "error": "DATABASE_URL ontbreekt."}), 500
+    ensure_privacy_settings_table()
+    ensure_conversation_tables()
+    tenant_id = tenant["tenant_id"]
+    try:
+        if request.method == "DELETE":
+            body = request.get_json(force=True, silent=True) or {}
+            if body.get("confirm") != "VERWIJDEREN":
+                return jsonify({"status": "error", "error": "Bevestiging ontbreekt."}), 400
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM conversations WHERE tenant_id = %s RETURNING id;", (tenant_id,))
+                    deleted = len(cur.fetchall())
+            return jsonify({"status": "success", "data": {"deletedConversations": deleted}}), 200
+
+        if request.method in ("PATCH", "POST"):
+            body = request.get_json(force=True, silent=True) or {}
+            retention = to_int_safe(body.get("retentionDays") or body.get("retention_days"), 90)
+            if retention not in (60, 90):
+                return jsonify({"status": "error", "error": "Bewaartermijn moet 60 of 90 dagen zijn."}), 400
+            profile = body.get("profile") if isinstance(body.get("profile"), dict) else None
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    if profile is None:
+                        cur.execute("""
+                            INSERT INTO tenant_privacy_settings (tenant_id, retention_days)
+                            VALUES (%s, %s)
+                            ON CONFLICT (tenant_id) DO UPDATE SET retention_days = EXCLUDED.retention_days, updated_at = NOW();
+                        """, (tenant_id, retention))
+                    else:
+                        cur.execute("""
+                            INSERT INTO tenant_privacy_settings (tenant_id, retention_days, profile_json)
+                            VALUES (%s, %s, %s::jsonb)
+                            ON CONFLICT (tenant_id) DO UPDATE SET retention_days = EXCLUDED.retention_days,
+                              profile_json = tenant_privacy_settings.profile_json || EXCLUDED.profile_json, updated_at = NOW();
+                        """, (tenant_id, retention, json.dumps(profile)))
+            run_retention_cleanup(force=True)
+
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO tenant_privacy_settings (tenant_id) VALUES (%s)
+                    ON CONFLICT (tenant_id) DO NOTHING;
+                """, (tenant_id,))
+                cur.execute("SELECT retention_days, profile_json, updated_at FROM tenant_privacy_settings WHERE tenant_id = %s;", (tenant_id,))
+                row = cur.fetchone()
+        return jsonify({"status": "success", "data": {"retentionDays": row[0], "profile": row[1] or {}, "updatedAt": row[2].isoformat() if row[2] else None}}), 200
+    except Exception as exc:
+        log(f"❌ /privacy-settings error: {exc}")
+        return jsonify({"status": "error", "error": "Privacy-instellingen konden niet worden verwerkt.", "details": str(exc)}), 500
 
 # =========================
 # DB: conversations + messages
@@ -1348,6 +1466,8 @@ def classify_conversation():
 load_tenants_from_csv(TENANTS_CSV_PATH)
 ensure_monthly_usage_table()
 ensure_conversation_tables()
+ensure_privacy_settings_table()
+run_retention_cleanup(force=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
