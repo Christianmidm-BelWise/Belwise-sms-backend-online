@@ -334,16 +334,13 @@ def new_id(prefix: str) -> str:
 
 
 def get_default_tenant() -> Optional[Dict[str, Any]]:
-    # Prefer the explicitly configured tenant.
+    # A tenant is the business account using Reactify, not an end-customer/contact.
+    # The current logged-in platform account must map to exactly one tenant.
     if PREFERRED_TENANT_ID and PREFERRED_TENANT_ID in TENANTS_BY_ID:
         return TENANTS_BY_ID[PREFERRED_TENANT_ID]
-    # Reactify is the platform tenant used by the current dashboard.
-    if "reactify" in TENANTS_BY_ID:
-        return TENANTS_BY_ID["reactify"]
-    # Single-tenant installations remain automatic.
     if len(TENANTS_BY_ID) == 1:
         return next(iter(TENANTS_BY_ID.values()))
-    log("⚠️ No default tenant could be selected. Set REACTIFY_TENANT_ID.")
+    log("⚠️ No platform tenant selected. Set REACTIFY_TENANT_ID to the tenant_id of the logged-in business account.")
     return None
 
 
@@ -357,6 +354,21 @@ def get_tenant_from_request_or_default() -> Optional[Dict[str, Any]]:
     if tenant_id and tenant_id in TENANTS_BY_ID:
         return TENANTS_BY_ID[tenant_id]
     return get_default_tenant()
+
+
+def get_conversation_tenant(conversation_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve the tenant from the stored conversation instead of trusting the dashboard header."""
+    if not db_available() or not conversation_id:
+        return None
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM conversations WHERE id = %s LIMIT 1;", (conversation_id,))
+                row = cur.fetchone()
+        return TENANTS_BY_ID.get(row[0]) if row else None
+    except Exception as exc:
+        log(f"⚠️ get_conversation_tenant failed: {exc}")
+        return None
 
 
 def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: str = "", email: str = "", channel: str = "sms") -> Optional[Dict[str, Any]]:
@@ -980,8 +992,10 @@ def call_missed():
 @app.route("/conversations", methods=["GET", "PATCH", "POST", "DELETE"])
 def conversations():
     tenant = get_tenant_from_request_or_default()
-    if not tenant or not db_available():
+    if not db_available():
         return jsonify({"status": "success", "data": []}), 200
+    if not tenant:
+        return jsonify({"status": "error", "error": "Geen platformtenant geselecteerd. Stel REACTIFY_TENANT_ID correct in."}), 400
     try:
         ensure_conversation_tables()
 
@@ -1054,8 +1068,7 @@ def conversations():
         limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                base_query = """
                     SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
                            c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
                            c.recommended_action, c.suggested_reply, c.created_at, c.updated_at,
@@ -1065,12 +1078,8 @@ def conversations():
                       SELECT body, created_at, direction FROM conversation_messages m
                       WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
                     ) lm ON TRUE
-                    WHERE c.tenant_id = %s
-                    ORDER BY c.updated_at DESC
-                    LIMIT %s;
-                    """,
-                    (tenant["tenant_id"], limit),
-                )
+                """
+                cur.execute(base_query + " WHERE c.tenant_id = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], limit))
                 rows = cur.fetchall()
         data = []
         for r in rows:
@@ -1090,11 +1099,13 @@ def conversations():
 
 @app.route("/conversation-messages", methods=["GET"])
 def conversation_messages():
-    tenant = get_tenant_from_request_or_default()
     conversation_id = (request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
     if not conversation_id:
         return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
-    if not tenant or not db_available():
+    if not db_available():
+        return jsonify({"status": "success", "data": []}), 200
+    tenant = get_conversation_tenant(conversation_id) or get_tenant_from_request_or_default()
+    if not tenant:
         return jsonify({"status": "success", "data": []}), 200
     try:
         ensure_conversation_tables()
