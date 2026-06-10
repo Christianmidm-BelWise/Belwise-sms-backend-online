@@ -959,9 +959,9 @@ def call_missed():
 
     if caller:
         opening = tenant.get("opening_line") or "Bedankt om te bellen. Hoe kan ik helpen?"
-        conv = get_or_create_conversation(tenant, phone=caller, channel="missed_call")
+        conv = get_or_create_conversation(tenant, phone=caller, channel="sms")
         if conv:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "missed_call", sender_type="system")
+            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", "Gemiste oproep", "sms", sender_type="system")
             update_conversation_ai(conv["id"], classify_text_basic("Gemiste oproep. Klant verwacht terugkoppeling."))
         send_sms(tenant, caller, opening)
         if conv:
