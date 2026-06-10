@@ -25,6 +25,11 @@ RETELL_BASE_URL = "https://api.retellai.com"
 
 RAW_DATABASE_URL = os.environ.get("DATABASE_URL") or ""
 TENANTS_CSV_PATH = os.environ.get("TENANTS_CSV_PATH") or "tenants.csv"
+PREFERRED_TENANT_ID = (
+    (os.environ.get("REACTIFY_TENANT_ID") or "").strip()
+    or (os.environ.get("CURRENT_TENANT_ID") or "").strip()
+    or (os.environ.get("TENANT_ID") or "").strip()
+)
 
 # ✅ Admin token (met fallbacks)
 ADMIN_TOKEN = (
@@ -318,6 +323,9 @@ def new_id(prefix: str) -> str:
 
 
 def get_default_tenant() -> Optional[Dict[str, Any]]:
+    # Prefer an explicit current tenant so old tenants/bots never leak into the platform.
+    if PREFERRED_TENANT_ID and PREFERRED_TENANT_ID in TENANTS_BY_ID:
+        return TENANTS_BY_ID[PREFERRED_TENANT_ID]
     if TENANTS_BY_ID:
         return next(iter(TENANTS_BY_ID.values()))
     return None
@@ -870,10 +878,11 @@ def conversations():
 
 @app.route("/conversation-messages", methods=["GET"])
 def conversation_messages():
+    tenant = get_tenant_from_request_or_default()
     conversation_id = (request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
     if not conversation_id:
         return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
-    if not db_available():
+    if not tenant or not db_available():
         return jsonify({"status": "success", "data": []}), 200
     try:
         ensure_conversation_tables()
@@ -881,12 +890,13 @@ def conversation_messages():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, conversation_id, tenant_id, direction, channel, body, external_id, created_at
-                    FROM conversation_messages
-                    WHERE conversation_id = %s
-                    ORDER BY created_at ASC;
+                    SELECT m.id, m.conversation_id, m.tenant_id, m.direction, m.channel, m.body, m.external_id, m.created_at
+                    FROM conversation_messages m
+                    INNER JOIN conversations c ON c.id = m.conversation_id AND c.tenant_id = m.tenant_id
+                    WHERE m.conversation_id = %s AND c.tenant_id = %s
+                    ORDER BY m.created_at ASC;
                     """,
-                    (conversation_id,),
+                    (conversation_id, tenant["tenant_id"]),
                 )
                 rows = cur.fetchall()
         data = [{
@@ -900,6 +910,7 @@ def conversation_messages():
 
 
 @app.route("/send-sms", methods=["POST"])
+
 def inbox_send_sms():
     body = request.get_json(force=True, silent=True) or {}
     conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
