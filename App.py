@@ -719,7 +719,15 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
     compact = re.sub(r"[\s.!?,;:]+", " ", t).strip()
     greeting_only = compact in {"hoi", "hallo", "hey", "heey", "hi", "dag", "goedendag", "goeiedag", "goedemorgen", "goedenavond", "yo", "hoi daar", "hallo daar"}
 
-    wants_booking = any(w in t for w in [
+    wants_reschedule = any(w in t for w in [
+        "afspraak verleggen", "afspraak verplaatsen", "afspraak verzetten", "afspraak wijzigen",
+        "boeking verleggen", "boeking verplaatsen", "boeking verzetten", "boeking wijzigen",
+        "reservatie verleggen", "reservatie verplaatsen", "reservatie verzetten", "reservatie wijzigen",
+        "ander moment", "andere dag", "ander uur", "andere tijd", "nieuw moment",
+        "kan niet komen", "lukt niet", "past niet", "verplaats", "verleg", "verzet"
+    ])
+
+    wants_booking = (not wants_reschedule) and any(w in t for w in [
         "afspraak", "boeken", "inplannen", "planning", "wanneer", "beschikbaar",
         "morgen", "vandaag", "deze week", "volgende week", "reservatie", "reserveren"
     ])
@@ -743,10 +751,10 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
     inactive = any(w in t for w in [
         "ok bedankt", "oke bedankt", "dank u", "bedankt", "merci", "top bedankt",
         "in orde", "is goed", "prima", "tot dan", "afgesproken"
-    ]) and not (wants_booking or urgent or negative or human_request)
+    ]) and not (wants_reschedule or wants_booking or urgent or negative or human_request)
 
-    requires_human = bool(urgent or negative or human_request)
-    intent = "afspraak_maken" if wants_booking else ("menselijke_overname" if human_request else "vraag_stellen")
+    requires_human = bool(wants_reschedule or urgent or negative or human_request)
+    intent = "afspraak_verleggen" if wants_reschedule else ("afspraak_maken" if wants_booking else ("menselijke_overname" if human_request else "vraag_stellen"))
     urgency = "hoog" if (urgent or negative or human_request) else "normaal"
 
     if greeting_only:
@@ -761,6 +769,10 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
         summary = "Het gesprek lijkt afgerond. Er is momenteel geen verdere actie nodig."
         recommended = "Geen actie nodig, tenzij de klant opnieuw reageert."
         suggested = "Graag gedaan. Laat gerust iets weten als ik nog kan helpen."
+    elif wants_reschedule:
+        summary = "De klant wil een bestaande afspraak verleggen of wijzigen. Menselijke overname is nodig."
+        recommended = "Neem het gesprek over, controleer de bestaande afspraak in de agenda en stem een nieuw moment af."
+        suggested = "Dag, ik neem dit persoonlijk over en kijk de bestaande afspraak na. We stemmen samen een nieuw moment af."
     elif human_request:
         summary = "De klant vraagt expliciet om een medewerker of menselijke opvolging."
         recommended = "Neem het gesprek over en reageer persoonlijk."
@@ -775,7 +787,7 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
         suggested = "Dag, ik bekijk dit met prioriteit en kom zo snel mogelijk bij u terug."
     elif wants_booking:
         summary = "De klant wil een afspraak maken of een beschikbaar moment vinden."
-        recommended = "Stel twee concrete momenten voor of maak meteen een afspraak via Cal.com."
+        recommended = "Stel twee concrete momenten voor of maak meteen een afspraak via de agenda."
         suggested = "Dag, ik kan u hiermee helpen. Past woensdag om 10u of donderdag om 14u?"
     else:
         summary = "De klant heeft een vraag of verwacht verdere opvolging."
@@ -1878,9 +1890,12 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
     chat_id = get_or_create_chat_id(tenant, session_key)
     if not chat_id:
         return opening
+    known_name = extract_name_from_email_signature(text) or ""
     prompt = (
         "Je antwoordt nu uitsluitend via e-mail. Schrijf een professionele, natuurlijke e-mail in het Nederlands. "
         "Gebruik geen SMS-afkortingen. Voeg geen onderwerpregel toe in de tekst en herhaal de volledige e-mail niet. "
+        "Het e-mailadres van de klant is al bekend, want dit bericht kwam via e-mail binnen. "
+        "Vraag daarom NOOIT opnieuw naar het e-mailadres. Vraag alleen nog gegevens die echt ontbreken, zoals de volledige naam indien die niet bekend is. "
         "Wanneer de klant een concrete vraag stelt, begin je antwoord exact met: "
         "'Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent.' "
         "Beantwoord daarna meteen en inhoudelijk de vraag van de klant. "
@@ -1888,6 +1903,8 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
         "Geef geen algemene welkomstboodschap als vervanging voor het echte antwoord. "
         "Wanneer de klant geen vraag stelt, reageer je passend op de inhoud zonder deze verplichte openingszin. "
         "Sluit zelf niet af; Reactify voegt automatisch de vaste afsluiting toe.\n\n"
+        f"Bekend e-mailadres: {email_address}\n"
+        f"Bekende naam uit handtekening: {known_name or 'onbekend'}\n"
         f"Onderwerp: {subject}\nBericht van klant:\n{text}"
     )
     try:
@@ -1930,39 +1947,62 @@ def repair_generic_email_reply(customer_text: str, reply: str) -> str:
 
 
 def extract_name_from_email_signature(text: str) -> str:
-    """Herken een persoonsnaam direct onder een gebruikelijke e-mailafsluiting."""
+    """Herken een persoonsnaam uit introductie of e-mailhandtekening zonder bedrijfsnamen te gokken."""
     raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not raw.strip():
         return ""
+
+    intro_patterns = [
+        r"(?im)^\s*(?:mijn naam is|ik ben|u spreekt met)\s+([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+){0,4})\s*[,.!]*$",
+        r"(?im)^\s*naam\s*[:=-]\s*([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’.-]+){0,4})\s*$",
+    ]
+    for pattern in intro_patterns:
+        match = re.search(pattern, raw)
+        if match:
+            candidate = match.group(1).strip(" .,-")
+            if _valid_person_name_candidate(candidate):
+                return _title_person_name(candidate)
+
     lines = [re.sub(r"\s+", " ", line).strip(" \t,;:-") for line in raw.split("\n")]
     closing = re.compile(
-        r"^(?:met\s+)?(?:vriendelijke|hartelijke)\s+groet(?:en)?$|"
-        r"^groet(?:en)?$|^mvg$|^kind\s+regards$|^best\s+regards$|"
-        r"^regards$|^sincerely$|^cordialement$|^bien\s+à\s+vous$",
+        r"^(?:met\s+)?(?:vriendelijke|hartelijke)\s+groet(?:en)?[.!]?$|"
+        r"^groet(?:en)?[.!]?$|^mvg[.!]?$|^kind\s+regards[.!]?$|^best\s+regards[.!]?$|"
+        r"^regards[.!]?$|^sincerely[.!]?$|^cordialement[.!]?$|^bien\s+à\s+vous[.!]?$",
         re.IGNORECASE,
     )
-    blocked = {
-        "team", "reactify", "klantendienst", "customer service", "support",
-        "administratie", "sales", "marketing", "directie", "bedrijf",
-    }
     for index, line in enumerate(lines):
         if not closing.match(line):
             continue
-        for candidate in lines[index + 1:index + 4]:
+        for candidate in lines[index + 1:index + 5]:
             if not candidate:
                 continue
-            if "@" in candidate or re.search(r"https?://|www\.|\d{4,}", candidate, re.I):
-                continue
-            cleaned = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' .-]", "", candidate).strip(" .-")
-            words = [w for w in cleaned.split() if w]
-            if not 1 <= len(words) <= 5 or len(cleaned) < 2 or len(cleaned) > 70:
-                continue
-            if cleaned.lower() in blocked:
-                continue
-            if any(w.lower() in {"bv", "bvba", "nv", "vzw", "inc", "ltd", "company"} for w in words):
-                continue
-            return " ".join(word[:1].upper() + word[1:] for word in words)
+            if re.match(r"(?i)^(verzonden vanaf|sent from|get outlook|download outlook)", candidate):
+                break
+            if _valid_person_name_candidate(candidate):
+                return _title_person_name(candidate)
     return ""
+
+
+def _title_person_name(value: str) -> str:
+    return " ".join(part[:1].upper() + part[1:].lower() for part in re.split(r"\s+", value.strip()) if part)
+
+
+def _valid_person_name_candidate(candidate: str) -> bool:
+    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’ .-]", "", candidate or "").strip(" .-")
+    words = [word for word in value.split() if word]
+    if not 1 <= len(words) <= 5 or not 2 <= len(value) <= 70:
+        return False
+    lower = value.lower()
+    blocked = {
+        "team", "reactify", "klantendienst", "customer service", "support", "administratie",
+        "sales", "marketing", "directie", "bedrijf", "verzonden vanaf outlook voor android",
+        "sent from my iphone", "sent from outlook", "met vriendelijke groet", "met vriendelijke groeten",
+    }
+    if lower in blocked or "@" in candidate or re.search(r"https?://|www\.|\d{4,}", candidate, re.I):
+        return False
+    if any(word.lower().strip(".") in {"bv", "bvba", "nv", "vzw", "inc", "ltd", "company", "team"} for word in words):
+        return False
+    return all(re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", word) for word in words)
 
 
 def update_email_contact_name_from_signature(conversation_id: str, tenant_id: str, signature_name: str) -> None:
@@ -1979,7 +2019,7 @@ def update_email_contact_name_from_signature(conversation_id: str, tenant_id: st
                     WHERE id = %s AND tenant_id = %s
                       AND (
                         contact_name IS NULL OR BTRIM(contact_name) = '' OR
-                        LOWER(contact_name) IN ('nieuwe lead', 'onbekende klant', 'klant') OR
+                        LOWER(contact_name) IN ('nieuwe lead', 'nieuwe klant', 'onbekende klant', 'onbekend', 'klant', 'lead', 'new lead', 'customer') OR
                         LOWER(contact_name) = LOWER(COALESCE(contact_email, '')) OR
                         contact_name LIKE '%%@%%' OR
                         LOWER(REGEXP_REPLACE(contact_name, '[^a-z0-9]', '', 'g')) =
