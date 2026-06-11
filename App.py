@@ -9,6 +9,7 @@ import smtplib
 import threading
 import base64
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -54,8 +55,12 @@ ADMIN_TOKEN = (
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 EMAIL_ENCRYPTION_KEY = (os.environ.get("EMAIL_ENCRYPTION_KEY") or "").strip()
 EMAIL_SYNC_LOCK = threading.Lock()
+EMAIL_SYNC_STATE_LOCK = threading.Lock()
+EMAIL_SYNC_RUNNING = set()
 EMAIL_SYNC_LAST_RUN: Dict[str, datetime] = {}
 EMAIL_SYNC_LAST_RESULT: Dict[str, Dict[str, Any]] = {}
+EMAIL_REPLY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="reactify-email-reply")
+EMAIL_NETWORK_TIMEOUT = max(4, min(15, int(os.environ.get("EMAIL_NETWORK_TIMEOUT", "8"))))
 
 
 def log(msg: str) -> None:
@@ -931,9 +936,11 @@ def _imap_connect(settings: Dict[str, Any]):
     host, port = settings["imapHost"], int(settings.get("imapPort") or 993)
     security = (settings.get("imapSecurity") or "ssl").lower()
     if security == "ssl":
-        client = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
+        client = imaplib.IMAP4_SSL(
+            host, port, ssl_context=ssl.create_default_context(), timeout=EMAIL_NETWORK_TIMEOUT
+        )
     else:
-        client = imaplib.IMAP4(host, port)
+        client = imaplib.IMAP4(host, port, timeout=EMAIL_NETWORK_TIMEOUT)
         if security == "starttls":
             client.starttls(ssl_context=ssl.create_default_context())
     client.login(settings.get("username") or settings.get("emailAddress"), settings.get("password") or "")
@@ -966,9 +973,9 @@ def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body
         host, port = settings["smtpHost"], int(settings.get("smtpPort") or 587)
         security = (settings.get("smtpSecurity") or "starttls").lower()
         if security == "ssl":
-            smtp = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=15)
+            smtp = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=EMAIL_NETWORK_TIMEOUT)
         else:
-            smtp = smtplib.SMTP(host, port, timeout=15)
+            smtp = smtplib.SMTP(host, port, timeout=EMAIL_NETWORK_TIMEOUT)
             smtp.ehlo()
             if security == "starttls":
                 smtp.starttls(context=ssl.create_default_context())
@@ -997,7 +1004,68 @@ def _last_email_thread_headers(conversation_id: str) -> Tuple[str, str]:
     return message_id, message_id
 
 
-def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, Any]:
+def _read_conversation_status(conversation_id: str, tenant_id: str) -> str:
+    if not db_available() or not conversation_id or not tenant_id:
+        return ""
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM conversations WHERE id = %s AND tenant_id = %s LIMIT 1;",
+                    (conversation_id, tenant_id),
+                )
+                row = cur.fetchone()
+        return (row[0] or "") if row else ""
+    except Exception as exc:
+        log(f"⚠️ Kon e-mailgespreksstatus niet lezen: {exc}")
+        return ""
+
+
+def _process_email_auto_reply(
+    tenant: Dict[str, Any], conversation_id: str, recipient: str, subject: str,
+    text_body: str, external_id: str, references: str, external_thread_id: str
+) -> None:
+    """Maak en verstuur een AI-e-mail buiten de HTTP-request.
+
+    IMAP-import blijft hierdoor snel en Netlify hoeft niet te wachten op Retell of SMTP.
+    Vlak voor verzending wordt de actuele overnamestatus opnieuw gecontroleerd.
+    """
+    tenant_id = tenant.get("tenant_id") or ""
+    try:
+        current_status = _read_conversation_status(conversation_id, tenant_id)
+        if is_ai_disabled_status(current_status):
+            log(f"ℹ️ Automatisch e-mailantwoord overgeslagen: AI staat uit voor {conversation_id}")
+            return
+
+        settings = get_email_settings(tenant_id, include_password=False) or {}
+        if not settings.get("enabled") or not settings.get("autoReply"):
+            return
+
+        reply = ask_retell_via_email(tenant, recipient, subject, text_body)
+        if not reply:
+            return
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        ok, sent_id, error = send_email_message(
+            tenant, recipient, reply_subject, reply,
+            in_reply_to=external_id,
+            references=(references + " " + external_id).strip(),
+        )
+        if not ok:
+            log(f"⚠️ Automatic email reply failed: {error}")
+            return
+
+        add_conversation_message(
+            conversation_id, tenant_id, "outgoing", reply, "email",
+            external_id=sent_id, sender_type="ai", subject=reply_subject,
+            external_thread_id=external_thread_id, in_reply_to=external_id,
+        )
+        set_conversation_status(conversation_id, tenant_id, "ai-active", False)
+        log(f"✅ Automatisch e-mailantwoord verzonden gesprek={conversation_id}")
+    except Exception as exc:
+        log(f"⚠️ Achtergrondtaak automatisch e-mailantwoord mislukt: {exc}")
+
+
+def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, Any]:
     """Synchroniseer recente mailboxberichten via IMAP UID.
 
     De synchronisatie gebruikt een kleine UID-lookback. Daardoor worden berichten
@@ -1011,7 +1079,7 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
     if not EMAIL_SYNC_LOCK.acquire(blocking=False):
         return {"processed": 0, "replied": 0, "scanned": 0, "busy": True, "enabled": True}
 
-    processed = replied = scanned = 0
+    processed = scanned = queued_replies = 0
     client = None
     saved_uid = int(settings.get("lastImapUid") or 0)
     highest_uid = saved_uid
@@ -1095,25 +1163,13 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
                     set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
                 continue
 
-            reply = ask_retell_via_email(tenant, from_email, subject, text_body)
-            if not reply:
-                continue
-            reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-            ok, sent_id, error = send_email_message(
-                tenant, from_email, reply_subject, reply,
-                in_reply_to=external_id,
-                references=(references + " " + external_id).strip(),
+            # Retell + SMTP mogen een Netlify-request nooit blokkeren.
+            # De inkomende e-mail staat al veilig in PostgreSQL; het antwoord loopt in de achtergrond.
+            EMAIL_REPLY_EXECUTOR.submit(
+                _process_email_auto_reply, tenant.copy(), conv["id"], from_email, subject,
+                text_body, external_id, references, external_thread_id,
             )
-            if ok:
-                add_conversation_message(
-                    conv["id"], tenant["tenant_id"], "outgoing", reply, "email",
-                    external_id=sent_id, sender_type="ai", subject=reply_subject,
-                    external_thread_id=external_thread_id, in_reply_to=external_id,
-                )
-                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
-                replied += 1
-            else:
-                log(f"⚠️ Automatic email reply failed: {error}")
+            queued_replies += 1
 
         if highest_uid > saved_uid:
             with psycopg2.connect(DATABASE_URL) as conn:
@@ -1124,7 +1180,8 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
                     )
         result = {
             "processed": processed,
-            "replied": replied,
+            "replied": 0,
+            "queuedReplies": queued_replies,
             "scanned": scanned,
             "enabled": True,
             "lastUid": highest_uid,
@@ -1140,26 +1197,61 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
         EMAIL_SYNC_LOCK.release()
 
 
-def maybe_sync_incoming_email(tenant: Dict[str, Any], min_interval_seconds: int = 12) -> Dict[str, Any]:
-    """Voer e-mailsync maximaal één keer per interval uit.
-
-    De gesprekkenroute gebruikt dit als vangnet, zodat inkomende mail blijft werken
-    wanneer de aparte Netlify email-sync functie tijdelijk niet beschikbaar is.
-    """
+def _email_sync_worker(tenant: Dict[str, Any]) -> None:
     tenant_id = tenant.get("tenant_id") or ""
-    now_utc = datetime.now(timezone.utc)
-    last_run = EMAIL_SYNC_LAST_RUN.get(tenant_id)
-    if last_run and (now_utc - last_run).total_seconds() < min_interval_seconds:
-        return EMAIL_SYNC_LAST_RESULT.get(tenant_id, {"processed": 0, "replied": 0, "enabled": True, "throttled": True})
-    EMAIL_SYNC_LAST_RUN[tenant_id] = now_utc
     try:
-        return sync_incoming_email(tenant)
+        result = sync_incoming_email(tenant, limit=25)
+        EMAIL_SYNC_LAST_RESULT[tenant_id] = result
     except Exception as exc:
         log(f"⚠️ Achtergrondsync inkomende e-mail mislukt: {exc}")
-        result = {"processed": 0, "replied": 0, "enabled": True, "error": str(exc)}
-        EMAIL_SYNC_LAST_RESULT[tenant_id] = result
-        return result
+        EMAIL_SYNC_LAST_RESULT[tenant_id] = {
+            "processed": 0, "replied": 0, "queuedReplies": 0,
+            "enabled": True, "error": str(exc),
+        }
+    finally:
+        with EMAIL_SYNC_STATE_LOCK:
+            EMAIL_SYNC_RUNNING.discard(tenant_id)
 
+
+def schedule_email_sync(
+    tenant: Dict[str, Any], min_interval_seconds: int = 20, force: bool = False
+) -> Dict[str, Any]:
+    """Plan IMAP-sync en antwoord onmiddellijk aan de webrequest.
+
+    Dit voorkomt Netlify 504 Inactivity Timeout. Slechts één sync per tenant kan tegelijk lopen.
+    """
+    tenant_id = tenant.get("tenant_id") or ""
+    settings = get_email_settings(tenant_id, include_password=False)
+    if not settings or not settings.get("enabled"):
+        return {"processed": 0, "replied": 0, "queuedReplies": 0, "enabled": False}
+
+    now_utc = datetime.now(timezone.utc)
+    with EMAIL_SYNC_STATE_LOCK:
+        if tenant_id in EMAIL_SYNC_RUNNING:
+            previous = dict(EMAIL_SYNC_LAST_RESULT.get(tenant_id, {}))
+            return {**previous, "enabled": True, "busy": True, "queued": False}
+
+        last_run = EMAIL_SYNC_LAST_RUN.get(tenant_id)
+        if not force and last_run and (now_utc - last_run).total_seconds() < min_interval_seconds:
+            previous = dict(EMAIL_SYNC_LAST_RESULT.get(tenant_id, {}))
+            return {**previous, "enabled": True, "throttled": True, "queued": False}
+
+        EMAIL_SYNC_LAST_RUN[tenant_id] = now_utc
+        EMAIL_SYNC_RUNNING.add(tenant_id)
+
+    threading.Thread(
+        target=_email_sync_worker,
+        args=(tenant.copy(),),
+        daemon=True,
+        name=f"email-sync-{tenant_id[:18]}",
+    ).start()
+    previous = dict(EMAIL_SYNC_LAST_RESULT.get(tenant_id, {}))
+    return {**previous, "enabled": True, "queued": True, "busy": False}
+
+
+def maybe_sync_incoming_email(tenant: Dict[str, Any], min_interval_seconds: int = 30) -> Dict[str, Any]:
+    """Backwards-compatible niet-blokkerende wrapper voor bestaande codepaden."""
+    return schedule_email_sync(tenant, min_interval_seconds=min_interval_seconds, force=False)
 
 def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: str, text: str) -> str:
     opening = tenant.get("opening_line") or "Bedankt voor uw e-mail."
@@ -1178,7 +1270,7 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
         r = requests.post(
             f"{RETELL_BASE_URL}/create-chat-completion",
             headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
-            json={"chat_id": chat_id, "content": prompt}, timeout=30,
+            json={"chat_id": chat_id, "content": prompt}, timeout=12,
         )
         data = r.json() if r.content else {}
         for m in reversed(data.get("messages", [])):
@@ -1581,10 +1673,10 @@ def conversations():
     try:
         ensure_conversation_tables()
 
-        # De bestaande /conversations-poll is altijd beschikbaar in de inbox.
-        # Gebruik hem ook als vangnet voor IMAP-sync, maximaal één keer per 12 seconden.
+        # De inboxpoll mag nooit op IMAP, Retell of SMTP wachten.
+        # Plan hoogstens een achtergrondsync; de gesprekkenlijst antwoordt direct.
         if request.method == "GET":
-            maybe_sync_incoming_email(tenant, min_interval_seconds=12)
+            schedule_email_sync(tenant, min_interval_seconds=30, force=False)
 
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
@@ -1943,10 +2035,13 @@ def email_sync():
     if not tenant:
         return jsonify({"status": "error", "error": "Geen platformtenant geselecteerd."}), 400
     try:
-        return jsonify({"status": "success", "data": sync_incoming_email(tenant)}), 200
+        body = request.get_json(force=False, silent=True) or {}
+        force = str(request.args.get("force") or body.get("force") or "").lower() in ("1", "true", "yes")
+        result = schedule_email_sync(tenant, min_interval_seconds=20, force=force)
+        return jsonify({"status": "success", "data": result}), 202 if result.get("queued") else 200
     except Exception as exc:
         log(f"❌ /email/sync error: {exc}")
-        return jsonify({"status": "error", "error": "E-mailsynchronisatie mislukt.", "details": str(exc)}), 502
+        return jsonify({"status": "error", "error": "E-mailsynchronisatie kon niet worden gestart.", "details": str(exc)}), 502
 
 
 @app.route("/send-message", methods=["POST"])
