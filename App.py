@@ -1728,8 +1728,15 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
     if not chat_id:
         return opening
     prompt = (
-        "Je antwoordt nu via e-mail. Schrijf een professionele, natuurlijke e-mail in het Nederlands. "
-        "Gebruik geen SMS-afkortingen. Voeg geen onderwerpregel toe in de tekst en herhaal de volledige e-mail niet.\n\n"
+        "Je antwoordt nu uitsluitend via e-mail. Schrijf een professionele, natuurlijke e-mail in het Nederlands. "
+        "Gebruik geen SMS-afkortingen. Voeg geen onderwerpregel toe in de tekst en herhaal de volledige e-mail niet. "
+        "Wanneer de klant een concrete vraag stelt, begin je antwoord exact met: "
+        "'Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent.' "
+        "Beantwoord daarna meteen en inhoudelijk de vraag van de klant. "
+        "Vraag niet opnieuw waarmee je kunt helpen wanneer de vraag al duidelijk is. "
+        "Geef geen algemene welkomstboodschap als vervanging voor het echte antwoord. "
+        "Wanneer de klant geen vraag stelt, reageer je passend op de inhoud zonder deze verplichte openingszin. "
+        "Sluit zelf niet af; Reactify voegt automatisch de vaste afsluiting toe.\n\n"
         f"Onderwerp: {subject}\nBericht van klant:\n{text}"
     )
     try:
@@ -1804,7 +1811,7 @@ def update_email_contact_name_from_signature(conversation_id: str, tenant_id: st
                         LOWER(REGEXP_REPLACE(SPLIT_PART(COALESCE(contact_email, ''), '@', 1), '[^a-z0-9]', '', 'g')) OR
                         LOWER(%s) LIKE LOWER(BTRIM(contact_name)) || ' %%'
                       );
-                """, (name, name, conversation_id, tenant_id))
+                """, (name, conversation_id, tenant_id, name))
     except Exception as exc:
         log(f"⚠️ Naam uit e-mailhandtekening opslaan mislukt: {exc}")
 
