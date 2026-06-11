@@ -1454,6 +1454,44 @@ def maybe_sync_incoming_email(tenant: Dict[str, Any], min_interval_seconds: int 
     """Backwards-compatible niet-blokkerende wrapper voor bestaande codepaden."""
     return schedule_email_sync(tenant, min_interval_seconds=min_interval_seconds, force=False)
 
+def get_or_create_chat_id(tenant: Dict[str, Any], contact_key: str) -> Optional[str]:
+    """Maak of hergebruik één Retell-chatsessie per tenant en contact/kanaal."""
+    key = (tenant["tenant_id"], contact_key)
+    if key in SMS_SESSIONS:
+        return SMS_SESSIONS[key]
+    if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
+        return None
+    context = get_contact_context(tenant["tenant_id"], contact_key)
+    is_email = str(contact_key).startswith("email:")
+    try:
+        response = requests.post(
+            f"{RETELL_BASE_URL}/create-chat",
+            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "agent_id": tenant["retell_agent_id"],
+                "metadata": {"contact": contact_key, "channel": "email" if is_email else "sms"},
+                "retell_llm_dynamic_variables": {
+                    **context,
+                    "customer_phone": "" if is_email else normalize_phone(contact_key),
+                    "customer_email": str(contact_key).split(":", 1)[1] if is_email else context.get("customer_email", ""),
+                    "channel": "email" if is_email else "sms",
+                },
+            },
+            timeout=EMAIL_NETWORK_TIMEOUT,
+        )
+        data = response.json() if response.content else {}
+        if not response.ok:
+            log(f"⚠️ Retell create-chat failed status={response.status_code}: {str(data)[:300]}")
+            return None
+        chat_id = data.get("chat_id") or data.get("id")
+        if chat_id:
+            SMS_SESSIONS[key] = chat_id
+            return chat_id
+    except Exception as exc:
+        log(f"⚠️ Retell create-chat error: {exc}")
+    return None
+
+
 def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: str, text: str) -> str:
     opening = tenant.get("opening_line") or "Bedankt voor uw e-mail."
     if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
@@ -1881,7 +1919,7 @@ def conversations():
 
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
-            action = (body.get("action") or request.args.get("action") or "trash").strip().lower()
+            action = (body.get("action") or request.args.get("action") or "permanent").strip().lower()
             conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
@@ -1891,12 +1929,9 @@ def conversations():
                         return jsonify({"status": "success", "data": {"emptied": len(ids), "ids": ids}}), 200
                     if not conversation_id:
                         return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
-                    if action in ("permanent", "delete-permanently"):
-                        cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
-                    else:
-                        cur.execute("UPDATE conversations SET folder = 'trash', deleted_at = NOW(), updated_at = NOW() WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
+                    cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
                     ids = [r[0] for r in cur.fetchall()]
-            return jsonify({"status": "success", "data": {"deleted": True, "soft": action not in ("permanent", "delete-permanently"), "ids": ids}}), 200
+            return jsonify({"status": "success", "data": {"deleted": True, "soft": False, "ids": ids}}), 200
 
         if request.method in ("PATCH", "POST"):
             body = request.get_json(force=True, silent=True) or {}
@@ -1909,7 +1944,7 @@ def conversations():
             channel = requested_channel or ("sms" if request.method == "POST" else "")
             subject = (body.get("subject") or "").strip()
             folder = (body.get("folder") or "").strip().lower()
-            if folder not in ("", "inbox", "spam", "trash"):
+            if folder not in ("", "inbox", "spam"):
                 return jsonify({"status": "error", "error": "Ongeldige map."}), 400
 
             # POST zonder status = nieuw gesprek/contact aanmaken vanuit Reactify.
@@ -1937,13 +1972,13 @@ def conversations():
                             channel = COALESCE(NULLIF(%s, ''), channel),
                             subject = COALESCE(NULLIF(%s, ''), subject),
                             folder = COALESCE(NULLIF(%s, ''), folder),
-                            status = CASE WHEN %s IN ('spam','trash') THEN 'inactive' ELSE status END,
-                            requires_human = CASE WHEN %s IN ('spam','trash') THEN FALSE ELSE requires_human END,
-                            deleted_at = CASE WHEN %s = 'trash' THEN NOW() WHEN %s IN ('inbox','spam') THEN NULL ELSE deleted_at END,
+                            status = CASE WHEN %s = 'spam' THEN 'inactive' ELSE status END,
+                            requires_human = CASE WHEN %s = 'spam' THEN FALSE ELSE requires_human END,
+                            deleted_at = CASE WHEN %s IN ('inbox','spam') THEN NULL ELSE deleted_at END,
                             updated_at = NOW()
                         WHERE id = %s AND tenant_id = %s;
                         """,
-                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, folder, folder, conversation_id, tenant["tenant_id"]),
+                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, folder, conversation_id, tenant["tenant_id"]),
                     )
 
             if status:
