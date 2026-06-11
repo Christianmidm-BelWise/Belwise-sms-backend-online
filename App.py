@@ -1868,22 +1868,72 @@ def email_settings():
 
 @app.route("/email/test", methods=["POST"])
 def email_test():
+    """Test IMAP en SMTP zonder een testmail te versturen.
+
+    De vorige test verstuurde ook een bericht naar de eigen mailbox. Daardoor kon
+    de Netlify-proxy op tragere mailservers een timeout/HTTP 500 tonen, terwijl de
+    koppeling zelf al correct opgeslagen was. Deze test controleert beide logins
+    afzonderlijk en geeft een gerichte fout terug.
+    """
     tenant = get_tenant_from_request_or_default()
     if not tenant:
         return jsonify({"status": "error", "error": "Geen platformtenant geselecteerd."}), 400
+
+    settings = get_email_settings(tenant["tenant_id"], include_password=True)
+    if not settings:
+        return jsonify({"status": "error", "error": "Sla eerst de e-mailinstellingen op."}), 400
+    if not settings.get("password"):
+        return jsonify({"status": "error", "error": "Er is geen mailboxwachtwoord opgeslagen."}), 400
+
+    result = {"imap": False, "smtp": False}
+
     try:
-        settings = get_email_settings(tenant["tenant_id"], include_password=True)
-        if not settings:
-            return jsonify({"status": "error", "error": "Sla eerst de e-mailinstellingen op."}), 400
         imap = _imap_connect(settings)
-        imap.select("INBOX")
-        imap.logout()
-        ok, _, error = send_email_message(tenant, settings["emailAddress"], "Reactify testmail", "De e-mailkoppeling met Reactify werkt correct.")
-        if not ok:
-            return jsonify({"status": "error", "error": "IMAP werkt, maar SMTP verzenden mislukte.", "details": error}), 502
-        return jsonify({"status": "success", "data": {"ok": True}}), 200
+        status, _ = imap.select("INBOX", readonly=True)
+        result["imap"] = status == "OK"
+        try:
+            imap.logout()
+        except Exception:
+            pass
     except Exception as exc:
-        return jsonify({"status": "error", "error": "Verbindingstest mislukt.", "details": str(exc)}), 502
+        return jsonify({
+            "status": "error",
+            "error": "IMAP-verbinding mislukt.",
+            "details": str(exc),
+            "data": result,
+        }), 502
+
+    smtp = None
+    try:
+        host = settings["smtpHost"]
+        port = int(settings.get("smtpPort") or 587)
+        security = (settings.get("smtpSecurity") or "starttls").lower()
+        if security == "ssl":
+            smtp = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=12)
+        else:
+            smtp = smtplib.SMTP(host, port, timeout=12)
+            smtp.ehlo()
+            if security == "starttls":
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+        smtp.login(settings.get("username") or settings.get("emailAddress"), settings.get("password") or "")
+        code, _ = smtp.noop()
+        result["smtp"] = int(code) < 400
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "error": "IMAP werkt, maar SMTP-verbinding mislukt.",
+            "details": str(exc),
+            "data": result,
+        }), 502
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+
+    return jsonify({"status": "success", "data": {**result, "ok": True}}), 200
 
 
 @app.route("/email/sync", methods=["POST"])
