@@ -2458,13 +2458,21 @@ def conversations():
                     SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
                            c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
                            c.recommended_action, c.suggested_reply, c.subject, c.external_thread_id, c.folder, c.deleted_at, c.created_at, c.updated_at,
-                           lm.body AS last_message, lm.created_at AS last_message_at, lm.direction AS last_message_direction
+                           lm.body AS last_message, lm.created_at AS last_message_at, lm.direction AS last_message_direction,
+                           incoming_mail.body AS latest_incoming_message
                     FROM conversations c
                     LEFT JOIN tenant_email_settings tes ON tes.tenant_id = c.tenant_id
                     LEFT JOIN LATERAL (
                       SELECT body, created_at, direction FROM conversation_messages m
                       WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
                     ) lm ON TRUE
+                    LEFT JOIN LATERAL (
+                      SELECT body FROM conversation_messages im
+                      WHERE im.conversation_id = c.id
+                        AND im.channel = 'email'
+                        AND im.direction = 'incoming'
+                      ORDER BY im.created_at DESC LIMIT 1
+                    ) incoming_mail ON TRUE
                 """
                 cutoff_clause = " AND (c.channel <> 'email' OR tes.sync_started_at IS NULL OR c.created_at >= tes.sync_started_at)"
                 if requested_folder == "all":
@@ -2474,14 +2482,22 @@ def conversations():
                 rows = cur.fetchall()
         data = []
         for r in rows:
+            stored_name = (r[4] or "").strip()
+            latest_incoming_message = r[22] or ""
+            detected_name = extract_name_from_email_signature(latest_incoming_message) if (r[5] or "").lower() == "email" else ""
+            resolved_name = stored_name
+            if detected_name and is_generic_contact_name(stored_name):
+                resolved_name = detected_name
+                update_email_contact_name_from_signature(r[0], r[1], detected_name)
             data.append({
                 "id": r[0], "tenant_id": r[1], "contact_phone": r[2] or "", "contact_email": r[3] or "",
-                "contact_name": r[4] or r[2] or "Onbekende klant", "channel": r[5] or "sms", "status": r[6] or "ai-active",
+                "contact_name": resolved_name or r[2] or "Onbekende klant", "channel": r[5] or "sms", "status": r[6] or "ai-active",
                 "intent": r[7] or "", "urgency": r[8] or "", "requires_human": bool(r[9]), "summary": r[10] or "",
                 "recommended_action": r[11] or "", "suggested_reply": r[12] or "", "subject": r[13] or "", "external_thread_id": r[14] or "",
                 "folder": r[15] or "inbox", "deleted_at": r[16].isoformat() if r[16] else None,
                 "created_at": r[17].isoformat() if r[17] else None, "updated_at": r[18].isoformat() if r[18] else None,
                 "last_message": r[19] or "", "last_message_at": r[20].isoformat() if r[20] else None, "last_message_direction": r[21] or "",
+                "latest_incoming_message": latest_incoming_message,
             })
         return jsonify({"status": "success", "data": data}), 200
     except Exception as e:
