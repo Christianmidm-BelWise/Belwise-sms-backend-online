@@ -581,6 +581,19 @@ def get_conversation_tenant(conversation_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def is_generic_contact_name(value: str) -> bool:
+    """Herken tijdelijke profielnamen die nooit een echte naam mogen overschrijven."""
+    name = re.sub(r"\s+", " ", (value or "").strip()).lower()
+    if not name:
+        return True
+    if "@" in name:
+        return True
+    return name in {
+        "nieuwe lead", "nieuwe klant", "onbekende klant", "onbekend",
+        "klant", "lead", "geen naam", "unknown", "new lead", "customer"
+    }
+
+
 def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: str = "", email: str = "", channel: str = "sms", subject: str = "", external_thread_id: str = "") -> Optional[Dict[str, Any]]:
     if not db_available() or not tenant:
         return None
@@ -629,6 +642,9 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     if existing_updated_at and datetime.now(timezone.utc) - existing_updated_at > timedelta(minutes=30):
                         existing_status = 'inactive'
                         cur.execute("UPDATE conversations SET status = 'inactive', requires_human = FALSE WHERE id = %s;", (conv_id,))
+                    # Een IMAP-header zoals "Nieuwe lead" mag een eerder herkende
+                    # handtekeningnaam (bv. Chris Damian) nooit opnieuw overschrijven.
+                    safe_name = "" if is_generic_contact_name(name) else (name or "").strip()
                     cur.execute("""
                         UPDATE conversations
                         SET contact_name = COALESCE(NULLIF(%s, ''), contact_name),
@@ -639,8 +655,11 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                             external_thread_id = COALESCE(NULLIF(%s, ''), external_thread_id),
                             updated_at = NOW()
                         WHERE id = %s;
-                    """, (name or "", normalized_email, normalized_phone, normalized_channel, subject or "", external_thread_id or "", conv_id))
-                    return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": name, "contact_email": normalized_email, "channel": normalized_channel, "subject": subject, "status": existing_status}
+                    """, (safe_name, normalized_email, normalized_phone, normalized_channel, subject or "", external_thread_id or "", conv_id))
+                    cur.execute("SELECT contact_name FROM conversations WHERE id = %s;", (conv_id,))
+                    saved_name_row = cur.fetchone()
+                    saved_name = (saved_name_row[0] if saved_name_row else "") or safe_name or name
+                    return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": saved_name, "contact_email": normalized_email, "channel": normalized_channel, "subject": subject, "status": existing_status}
                 conv_id = new_id("conv")
                 display_name = name or (normalized_email if normalized_channel == "email" else phone) or "Onbekende klant"
                 cur.execute("""
