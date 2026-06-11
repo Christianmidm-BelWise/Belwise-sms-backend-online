@@ -1801,9 +1801,10 @@ def update_email_contact_name_from_signature(conversation_id: str, tenant_id: st
                         LOWER(contact_name) = LOWER(COALESCE(contact_email, '')) OR
                         contact_name LIKE '%%@%%' OR
                         LOWER(REGEXP_REPLACE(contact_name, '[^a-z0-9]', '', 'g')) =
-                        LOWER(REGEXP_REPLACE(SPLIT_PART(COALESCE(contact_email, ''), '@', 1), '[^a-z0-9]', '', 'g'))
+                        LOWER(REGEXP_REPLACE(SPLIT_PART(COALESCE(contact_email, ''), '@', 1), '[^a-z0-9]', '', 'g')) OR
+                        LOWER(%s) LIKE LOWER(BTRIM(contact_name)) || ' %%'
                       );
-                """, (name, conversation_id, tenant_id))
+                """, (name, name, conversation_id, tenant_id))
     except Exception as exc:
         log(f"⚠️ Naam uit e-mailhandtekening opslaan mislukt: {exc}")
 
