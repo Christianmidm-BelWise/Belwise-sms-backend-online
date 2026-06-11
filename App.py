@@ -516,6 +516,21 @@ def ensure_conversation_tables() -> None:
                     ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS last_imap_uid BIGINT NOT NULL DEFAULT 0;
                     ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS sync_epoch TEXT NOT NULL DEFAULT '';
                     ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS sync_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+                    CREATE TABLE IF NOT EXISTS email_import_tombstones (
+                      tenant_id TEXT NOT NULL,
+                      external_id TEXT NOT NULL,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      PRIMARY KEY (tenant_id, external_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS email_auto_reply_claims (
+                      tenant_id TEXT NOT NULL,
+                      external_id TEXT NOT NULL,
+                      conversation_id TEXT NOT NULL,
+                      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      sent_at TIMESTAMPTZ,
+                      PRIMARY KEY (tenant_id, external_id)
+                    );
                     """
                 )
         _CONVERSATION_TABLES_READY = True
@@ -1185,6 +1200,83 @@ def _read_conversation_status(conversation_id: str, tenant_id: str) -> str:
         return ""
 
 
+def _email_external_is_tombstoned(tenant_id: str, external_id: str) -> bool:
+    if not tenant_id or not external_id or not db_available():
+        return False
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM email_import_tombstones WHERE tenant_id = %s AND external_id = %s LIMIT 1;",
+                    (tenant_id, external_id),
+                )
+                return bool(cur.fetchone())
+    except Exception as exc:
+        log(f"⚠️ Tombstonecontrole mislukt: {exc}")
+        return False
+
+
+def _claim_email_auto_reply(tenant_id: str, external_id: str, conversation_id: str) -> bool:
+    if not tenant_id or not external_id or not conversation_id or not db_available():
+        return False
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO email_auto_reply_claims (tenant_id, external_id, conversation_id)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING external_id;
+                    """,
+                    (tenant_id, external_id, conversation_id),
+                )
+                return bool(cur.fetchone())
+    except Exception as exc:
+        log(f"⚠️ E-mailantwoord claim mislukt: {exc}")
+        return False
+
+
+def _release_email_auto_reply_claim(tenant_id: str, external_id: str) -> None:
+    if not tenant_id or not external_id or not db_available():
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM email_auto_reply_claims WHERE tenant_id = %s AND external_id = %s AND sent_at IS NULL;",
+                    (tenant_id, external_id),
+                )
+    except Exception as exc:
+        log(f"⚠️ E-mailantwoord claim vrijgeven mislukt: {exc}")
+
+
+def _mark_email_auto_reply_sent(tenant_id: str, external_id: str) -> None:
+    if not tenant_id or not external_id or not db_available():
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE email_auto_reply_claims SET sent_at = NOW() WHERE tenant_id = %s AND external_id = %s;",
+                    (tenant_id, external_id),
+                )
+    except Exception as exc:
+        log(f"⚠️ E-mailantwoord claim afronden mislukt: {exc}")
+
+
+def _name_from_email_address(email_address: str) -> str:
+    local = (email_address or "").split("@", 1)[0]
+    local = re.sub(r"[._-]+", " ", local)
+    local = re.sub(r"\d+", " ", local)
+    parts = [p for p in local.split() if len(p) > 1]
+    if not parts:
+        return ""
+    # Aaneengeschreven voor- en achternaam zoals christiandamian blijft moeilijk
+    # betrouwbaar te splitsen; gebruik minstens nette titelkapitalisatie.
+    return " ".join(p.capitalize() for p in parts[:4])
+
+
 def _process_email_auto_reply(
     tenant: Dict[str, Any], conversation_id: str, recipient: str, subject: str,
     text_body: str, external_id: str, references: str, external_thread_id: str
@@ -1207,6 +1299,7 @@ def _process_email_auto_reply(
 
         reply = ask_retell_via_email(tenant, recipient, subject, text_body)
         if not reply:
+            _release_email_auto_reply_claim(tenant_id, external_id)
             return
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         ok, sent_id, error = send_email_message(
@@ -1216,6 +1309,7 @@ def _process_email_auto_reply(
         )
         if not ok:
             log(f"⚠️ Automatic email reply failed: {error}")
+            _release_email_auto_reply_claim(tenant_id, external_id)
             return
 
         add_conversation_message(
@@ -1224,8 +1318,10 @@ def _process_email_auto_reply(
             external_thread_id=external_thread_id, in_reply_to=external_id,
         )
         set_conversation_status(conversation_id, tenant_id, "ai-active", False)
+        _mark_email_auto_reply_sent(tenant_id, external_id)
         log(f"✅ Automatisch e-mailantwoord verzonden gesprek={conversation_id}")
     except Exception as exc:
+        _release_email_auto_reply_claim(tenant_id, external_id)
         log(f"⚠️ Achtergrondtaak automatisch e-mailantwoord mislukt: {exc}")
 
 
@@ -1312,6 +1408,8 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 continue
 
             external_id = str(message.get("Message-ID") or "").strip() or f"imap-uid:{numeric_uid}"
+            if _email_external_is_tombstoned(tenant["tenant_id"], external_id):
+                continue
             subject = str(message.get("Subject") or "").strip() or "Zonder onderwerp"
             normalized_subject = _normalized_subject(subject)
             in_reply_to = str(message.get("In-Reply-To") or "").strip()
@@ -1322,9 +1420,10 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 continue
             target_folder = "spam" if _email_is_spam_or_marketing(message, from_email, subject, text_body) else "inbox"
 
+            inferred_name = from_name or _name_from_email_address(from_email) or from_email
             conv = get_or_create_conversation(
                 tenant,
-                name=from_name or from_email,
+                name=inferred_name,
                 email=from_email,
                 channel="email",
                 subject=normalized_subject,
@@ -1375,11 +1474,14 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
 
             # Retell + SMTP mogen een Netlify-request nooit blokkeren.
             # De inkomende e-mail staat al veilig in PostgreSQL; het antwoord loopt in de achtergrond.
-            EMAIL_REPLY_EXECUTOR.submit(
-                _process_email_auto_reply, tenant.copy(), conv["id"], from_email, subject,
-                text_body, external_id, references, external_thread_id,
-            )
-            queued_replies += 1
+            if _claim_email_auto_reply(tenant["tenant_id"], external_id, conv["id"]):
+                EMAIL_REPLY_EXECUTOR.submit(
+                    _process_email_auto_reply, tenant.copy(), conv["id"], from_email, subject,
+                    text_body, external_id, references, external_thread_id,
+                )
+                queued_replies += 1
+            else:
+                log(f"ℹ️ Automatisch antwoord al geclaimd/verzonden voor {external_id}")
 
         if highest_uid > saved_uid:
             with psycopg2.connect(DATABASE_URL) as conn:
@@ -2058,6 +2160,20 @@ def conversations():
                         return jsonify({"status": "success", "data": {"emptied": len(ids), "ids": ids}}), 200
                     if not conversation_id:
                         return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+                    # Onthoud alle inkomende e-mail-ID's vóór definitief verwijderen.
+                    # Zo wordt een nog aanwezige mail op IMAP nooit opnieuw geïmporteerd.
+                    cur.execute(
+                        """
+                        INSERT INTO email_import_tombstones (tenant_id, external_id)
+                        SELECT tenant_id, external_id
+                        FROM conversation_messages
+                        WHERE conversation_id = %s AND tenant_id = %s
+                          AND channel = 'email' AND direction = 'incoming'
+                          AND COALESCE(external_id, '') <> ''
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (conversation_id, tenant["tenant_id"]),
+                    )
                     cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
                     ids = [r[0] for r in cur.fetchall()]
             return jsonify({"status": "success", "data": {"deleted": True, "soft": False, "ids": ids}}), 200
