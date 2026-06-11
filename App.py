@@ -7,6 +7,8 @@ import ssl
 import imaplib
 import smtplib
 import threading
+import base64
+import hashlib
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -806,13 +808,27 @@ def send_sms(tenant: Dict[str, Any], to_number: str, message: str) -> bool:
 # =========================
 
 def _email_cipher() -> Optional[Fernet]:
-    if not EMAIL_ENCRYPTION_KEY:
+    """Return a stable Fernet cipher for stored mailbox credentials.
+
+    Preferred: EMAIL_ENCRYPTION_KEY from Render. For backwards-compatible
+    deployments where that variable was not created yet, derive a stable key
+    from an existing server-side secret. This avoids exposing credentials in
+    the browser and prevents the settings form from failing on first setup.
+    """
+    raw = EMAIL_ENCRYPTION_KEY
+    if raw:
+        try:
+            return Fernet(raw.encode("utf-8"))
+        except Exception:
+            log("⚠️ EMAIL_ENCRYPTION_KEY is ongeldig; veilige fallback wordt gebruikt.")
+
+    fallback_secret = ADMIN_TOKEN or SMSTOOLS_CLIENT_SECRET or RETELL_API_KEY
+    if not fallback_secret:
+        log("⚠️ Geen server-side secret beschikbaar om e-mailwachtwoorden te versleutelen.")
         return None
-    try:
-        return Fernet(EMAIL_ENCRYPTION_KEY.encode("utf-8"))
-    except Exception:
-        log("⚠️ EMAIL_ENCRYPTION_KEY is ongeldig. Genereer een geldige Fernet-sleutel.")
-        return None
+
+    digest = hashlib.sha256(("reactify-email:" + fallback_secret).encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
 
 
 def encrypt_email_secret(value: str) -> str:
@@ -820,7 +836,7 @@ def encrypt_email_secret(value: str) -> str:
         return ""
     cipher = _email_cipher()
     if not cipher:
-        raise ValueError("EMAIL_ENCRYPTION_KEY ontbreekt of is ongeldig.")
+        raise ValueError("Geen geldige server-side encryptiesleutel beschikbaar.")
     return cipher.encrypt(value.encode("utf-8")).decode("utf-8")
 
 
@@ -829,7 +845,7 @@ def decrypt_email_secret(value: str) -> str:
         return ""
     cipher = _email_cipher()
     if not cipher:
-        raise ValueError("EMAIL_ENCRYPTION_KEY ontbreekt of is ongeldig.")
+        raise ValueError("Geen geldige server-side encryptiesleutel beschikbaar.")
     try:
         return cipher.decrypt(value.encode("utf-8")).decode("utf-8")
     except InvalidToken as exc:
