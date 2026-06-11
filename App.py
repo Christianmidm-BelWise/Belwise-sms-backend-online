@@ -794,11 +794,16 @@ def classify_text_basic(text: str) -> Dict[str, Any]:
         recommended = "Laat AI antwoorden, maar volg op als de klant bijkomende vragen stelt."
         suggested = "Dag, bedankt voor uw bericht. Ik kijk dit even na en kom hier zo snel mogelijk op terug."
 
+    negative_score = len(re.findall(r"klacht|boos|ontevreden|niet tevreden|probleem|fout|slecht|teleurgesteld|annuleer|geen reactie|niet geholpen", t))
+    positive_score = len(re.findall(r"bedankt|dank u|merci|opgelost|geholpen|bevestigd|prima|perfect|tevreden|top|fijn|in orde", t))
+    conversation_sentiment = "negatief" if negative_score > positive_score else ("positief" if positive_score > negative_score else "neutraal")
+
     return {
         "intent": intent,
         "urgency": urgency,
         "requiresHuman": requires_human,
         "inactive": inactive,
+        "sentiment": conversation_sentiment,
         "summary": summary,
         "recommendedAction": recommended,
         "suggestedReply": suggested,
@@ -2512,6 +2517,11 @@ def conversations():
             channel = requested_channel or ("sms" if request.method == "POST" else "")
             subject = (body.get("subject") or "").strip()
             folder = (body.get("folder") or "").strip().lower()
+            summary_value = (body.get("summary") or "").strip()
+            recommended_value = (body.get("recommendedAction") or body.get("recommended_action") or "").strip()
+            urgency_value = (body.get("urgency") or "").strip()
+            intent_value = (body.get("intent") or "").strip()
+            explicit_requires_human = body.get("requiresHuman") if "requiresHuman" in body else body.get("requires_human")
             if folder not in ("", "inbox", "spam"):
                 return jsonify({"status": "error", "error": "Ongeldige map."}), 400
 
@@ -2540,13 +2550,24 @@ def conversations():
                             channel = COALESCE(NULLIF(%s, ''), channel),
                             subject = COALESCE(NULLIF(%s, ''), subject),
                             folder = COALESCE(NULLIF(%s, ''), folder),
+                            summary = COALESCE(NULLIF(%s, ''), summary),
+                            recommended_action = COALESCE(NULLIF(%s, ''), recommended_action),
+                            urgency = COALESCE(NULLIF(%s, ''), urgency),
+                            intent = COALESCE(NULLIF(%s, ''), intent),
                             status = CASE WHEN %s = 'spam' THEN 'inactive' ELSE status END,
-                            requires_human = CASE WHEN %s = 'spam' THEN FALSE ELSE requires_human END,
+                            requires_human = CASE
+                              WHEN %s = 'spam' THEN FALSE
+                              WHEN %s IS NOT NULL THEN %s
+                              ELSE requires_human
+                            END,
                             deleted_at = CASE WHEN %s IN ('inbox','spam') THEN NULL ELSE deleted_at END,
                             updated_at = NOW()
                         WHERE id = %s AND tenant_id = %s;
                         """,
-                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, folder, conversation_id, tenant["tenant_id"]),
+                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder,
+                         summary_value, recommended_value, urgency_value, intent_value,
+                         folder, folder, explicit_requires_human, bool(explicit_requires_human) if explicit_requires_human is not None else None,
+                         folder, conversation_id, tenant["tenant_id"]),
                     )
 
             if status:
@@ -3031,10 +3052,20 @@ def classify_conversation():
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT body FROM conversation_messages WHERE conversation_id = %s ORDER BY created_at DESC LIMIT 10;", (conversation_id,))
-                text = "\n".join(r[0] for r in cur.fetchall())
+                cur.execute("SELECT status, tenant_id FROM conversations WHERE id = %s LIMIT 1;", (conversation_id,))
+                state_row = cur.fetchone()
+                cur.execute("SELECT body FROM conversation_messages WHERE conversation_id = %s ORDER BY created_at DESC LIMIT 25;", (conversation_id,))
+                rows = cur.fetchall()
+                text = "\n".join(r[0] for r in reversed(rows))
         analysis = classify_text_basic(text)
+        previous_status = (state_row[0] if state_row else "") or ""
+        tenant_id = state_row[1] if state_row else ""
         update_conversation_ai(conversation_id, analysis)
+        normalized_previous = previous_status.lower().replace("-", "_")
+        if normalized_previous in ("manual_overname", "manual_takeover", "overgenomen", "taken_over"):
+            set_conversation_status(conversation_id, tenant_id, "manual_overname", True)
+        elif normalized_previous in ("afgesloten", "closed", "completed"):
+            set_conversation_status(conversation_id, tenant_id, "afgesloten", False)
         return jsonify({"status": "success", "data": analysis}), 200
     except Exception as e:
         log(f"❌ /classify-conversation error: {e}")
