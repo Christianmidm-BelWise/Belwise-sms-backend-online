@@ -2522,7 +2522,8 @@ def conversations():
                     )
 
             if status:
-                requires_human = status.strip().lower().replace("-", "_") not in ("ai_active", "ai_actief")
+                normalized_status = status.strip().lower().replace("-", "_")
+                requires_human = normalized_status not in ("ai_active", "ai_actief", "afgesloten", "closed", "completed", "inactive")
                 set_conversation_status(conversation_id, tenant["tenant_id"], status, requires_human)
             else:
                 requires_human = None
