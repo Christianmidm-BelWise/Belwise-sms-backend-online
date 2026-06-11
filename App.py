@@ -54,6 +54,8 @@ ADMIN_TOKEN = (
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS") or "true").lower() in ("1", "true", "yes", "y")
 EMAIL_ENCRYPTION_KEY = (os.environ.get("EMAIL_ENCRYPTION_KEY") or "").strip()
 EMAIL_SYNC_LOCK = threading.Lock()
+EMAIL_SYNC_LAST_RUN: Dict[str, datetime] = {}
+EMAIL_SYNC_LAST_RESULT: Dict[str, Dict[str, Any]] = {}
 
 
 def log(msg: str) -> None:
@@ -996,50 +998,54 @@ def _last_email_thread_headers(conversation_id: str) -> Tuple[str, str]:
 
 
 def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, Any]:
-    """Synchroniseer nieuwe mailboxberichten op IMAP UID in plaats van alleen UNSEEN.
+    """Synchroniseer recente mailboxberichten via IMAP UID.
 
-    Hierdoor komen ook berichten binnen die door one.com Webmail of een andere
-    mailclient al als gelezen zijn gemarkeerd. De mailboxstatus zelf wordt niet
-    aangepast; deduplicatie gebeurt via Message-ID en de unieke database-index.
+    De synchronisatie gebruikt een kleine UID-lookback. Daardoor worden berichten
+    die tijdens een eerdere fout of deploy niet verwerkt raakten opnieuw bekeken,
+    terwijl de unieke Message-ID-index dubbele opslag voorkomt. Zowel gelezen als
+    ongelezen berichten worden opgehaald en de mailboxstatus wordt niet gewijzigd.
     """
     settings = get_email_settings(tenant["tenant_id"], include_password=True)
     if not settings or not settings.get("enabled"):
-        return {"processed": 0, "replied": 0, "enabled": False}
+        return {"processed": 0, "replied": 0, "scanned": 0, "enabled": False}
     if not EMAIL_SYNC_LOCK.acquire(blocking=False):
-        return {"processed": 0, "replied": 0, "busy": True, "enabled": True}
+        return {"processed": 0, "replied": 0, "scanned": 0, "busy": True, "enabled": True}
 
-    processed = replied = 0
+    processed = replied = scanned = 0
     client = None
-    highest_uid = int(settings.get("lastImapUid") or 0)
+    saved_uid = int(settings.get("lastImapUid") or 0)
+    highest_uid = saved_uid
     try:
         client = _imap_connect(settings)
         status, _ = client.select("INBOX", readonly=True)
         if status != "OK":
-            return {"processed": 0, "replied": 0, "enabled": True}
+            raise RuntimeError("De INBOX kon niet worden geopend.")
 
-        if highest_uid > 0:
-            status, data = client.uid("search", None, f"UID {highest_uid + 1}:*")
-            ids = (data[0] or b"").split() if status == "OK" and data else []
+        # Kijk bij elke synchronisatie ook een beperkt aantal oudere UID's terug.
+        # Zo gaan e-mails niet verloren wanneer een vorige verwerking halverwege faalde.
+        if saved_uid > 0:
+            lookback_from = max(1, saved_uid - 25)
+            status, data = client.uid("search", None, f"UID {lookback_from}:*")
         else:
-            # Eerste synchronisatie: importeer alleen de meest recente berichten.
             status, data = client.uid("search", None, "ALL")
-            ids = (data[0] or b"").split()[-max(1, min(limit, 100)):] if status == "OK" and data else []
+        ids = (data[0] or b"").split() if status == "OK" and data else []
+        ids = ids[-max(1, min(int(limit or 50) * 2, 150)):]
 
-        ids = ids[-max(1, min(limit, 100)):]
         for uid_value in ids:
             try:
                 numeric_uid = int(uid_value)
             except Exception:
-                numeric_uid = highest_uid
+                continue
 
-            status, rows = client.uid("fetch", uid_value, "(RFC822)")
+            status, rows = client.uid("fetch", uid_value, "(BODY.PEEK[])")
             if status != "OK" or not rows:
                 continue
             raw = next((row[1] for row in rows if isinstance(row, tuple) and len(row) > 1), None)
             if not raw:
                 continue
-            highest_uid = max(highest_uid, numeric_uid)
 
+            scanned += 1
+            highest_uid = max(highest_uid, numeric_uid)
             message = BytesParser(policy=policy.default).parsebytes(raw)
             from_name, from_email = parseaddr(str(message.get("From") or ""))
             from_email = from_email.strip().lower()
@@ -1066,6 +1072,7 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
                 external_thread_id=external_thread_id,
             )
             if not conv:
+                log(f"⚠️ E-mailgesprek kon niet worden aangemaakt uid={numeric_uid}")
                 continue
 
             inserted = add_conversation_message(
@@ -1075,6 +1082,7 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
                 in_reply_to=in_reply_to,
             )
             if not inserted:
+                # Reeds geïmporteerd; dit is normaal door de UID-lookback.
                 continue
 
             processed += 1
@@ -1107,14 +1115,22 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
             else:
                 log(f"⚠️ Automatic email reply failed: {error}")
 
-        if highest_uid > int(settings.get("lastImapUid") or 0):
+        if highest_uid > saved_uid:
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE tenant_email_settings SET last_imap_uid = %s WHERE tenant_id = %s;",
                         (highest_uid, tenant["tenant_id"]),
                     )
-        return {"processed": processed, "replied": replied, "enabled": True, "lastUid": highest_uid}
+        result = {
+            "processed": processed,
+            "replied": replied,
+            "scanned": scanned,
+            "enabled": True,
+            "lastUid": highest_uid,
+        }
+        EMAIL_SYNC_LAST_RESULT[tenant["tenant_id"]] = result
+        return result
     finally:
         try:
             if client:
@@ -1123,105 +1139,26 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, An
             pass
         EMAIL_SYNC_LOCK.release()
 
-# =========================
-# RETELL (simple)
-# =========================
 
+def maybe_sync_incoming_email(tenant: Dict[str, Any], min_interval_seconds: int = 12) -> Dict[str, Any]:
+    """Voer e-mailsync maximaal één keer per interval uit.
 
-def get_contact_context(tenant_id: str, phone: str) -> Dict[str, str]:
-    context = {"customer_name": "", "customer_email": "", "has_known_contact_data": "false"}
-    if not db_available() or not tenant_id or not phone:
-        return context
+    De gesprekkenroute gebruikt dit als vangnet, zodat inkomende mail blijft werken
+    wanneer de aparte Netlify email-sync functie tijdelijk niet beschikbaar is.
+    """
+    tenant_id = tenant.get("tenant_id") or ""
+    now_utc = datetime.now(timezone.utc)
+    last_run = EMAIL_SYNC_LAST_RUN.get(tenant_id)
+    if last_run and (now_utc - last_run).total_seconds() < min_interval_seconds:
+        return EMAIL_SYNC_LAST_RESULT.get(tenant_id, {"processed": 0, "replied": 0, "enabled": True, "throttled": True})
+    EMAIL_SYNC_LAST_RUN[tenant_id] = now_utc
     try:
-        normalized = normalize_phone(phone)
-        with psycopg2.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT COALESCE(contact_name, ''), COALESCE(contact_email, '')
-                    FROM conversations
-                    WHERE tenant_id = %s AND contact_phone = %s
-                    ORDER BY updated_at DESC
-                    LIMIT 1;
-                    """,
-                    (tenant_id, normalized),
-                )
-                row = cur.fetchone()
-        if row:
-            name = (row[0] or "").strip()
-            email = (row[1] or "").strip().lower()
-            if name and normalize_phone(name) != normalized:
-                context["customer_name"] = name
-            if email:
-                context["customer_email"] = email
-            context["has_known_contact_data"] = "true" if context["customer_name"] and context["customer_email"] else "false"
+        return sync_incoming_email(tenant)
     except Exception as exc:
-        log(f"⚠️ get_contact_context failed: {exc}")
-    return context
-
-def get_or_create_chat_id(tenant: Dict[str, Any], phone: str) -> Optional[str]:
-    key = (tenant["tenant_id"], phone)
-    if key in SMS_SESSIONS:
-        return SMS_SESSIONS[key]
-
-    if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
-        return None
-
-    try:
-        r = requests.post(
-            f"{RETELL_BASE_URL}/create-chat",
-            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "agent_id": tenant["retell_agent_id"],
-                "metadata": {"contact": phone},
-                "retell_llm_dynamic_variables": {
-                    **get_contact_context(tenant["tenant_id"], phone),
-                    "customer_phone": normalize_phone(phone) if not str(phone).startswith("email:") else "",
-                    "customer_email": str(phone).split(":", 1)[1] if str(phone).startswith("email:") else get_contact_context(tenant["tenant_id"], phone).get("customer_email", ""),
-                    "channel": "email" if str(phone).startswith("email:") else "sms",
-                },
-            },
-            timeout=25,
-        )
-        data = r.json() if r.content else {}
-        chat_id = data.get("chat_id") or data.get("id")
-        if chat_id:
-            SMS_SESSIONS[key] = chat_id
-            return chat_id
-    except Exception as e:
-        log(f"⚠️ Retell create-chat error: {e}")
-    return None
-
-
-def ask_retell_via_sms(tenant: Dict[str, Any], phone: str, text: str) -> str:
-    opening = tenant.get("opening_line") or "Bedankt voor je bericht."
-    if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
-        return opening
-
-    chat_id = get_or_create_chat_id(tenant, phone)
-    if not chat_id:
-        return opening
-
-    try:
-        r = requests.post(
-            f"{RETELL_BASE_URL}/create-chat-completion",
-            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
-            json={"chat_id": chat_id, "content": text},
-            timeout=30,
-        )
-        data = r.json() if r.content else {}
-        for m in reversed(data.get("messages", [])):
-            if m.get("role") == "agent":
-                content = (m.get("content") or "").strip()
-                return content or opening
-    except Exception as e:
-        log(f"⚠️ Retell completion error: {e}")
-
-    return opening
-
-
-
-
+        log(f"⚠️ Achtergrondsync inkomende e-mail mislukt: {exc}")
+        result = {"processed": 0, "replied": 0, "enabled": True, "error": str(exc)}
+        EMAIL_SYNC_LAST_RESULT[tenant_id] = result
+        return result
 
 
 def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: str, text: str) -> str:
@@ -1644,6 +1581,11 @@ def conversations():
     try:
         ensure_conversation_tables()
 
+        # De bestaande /conversations-poll is altijd beschikbaar in de inbox.
+        # Gebruik hem ook als vangnet voor IMAP-sync, maximaal één keer per 12 seconden.
+        if request.method == "GET":
+            maybe_sync_incoming_email(tenant, min_interval_seconds=12)
+
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
             conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
@@ -1995,7 +1937,7 @@ def email_test():
     return jsonify({"status": "success", "data": {**result, "ok": True}}), 200
 
 
-@app.route("/email/sync", methods=["POST"])
+@app.route("/email/sync", methods=["GET", "POST"])
 def email_sync():
     tenant = get_tenant_from_request_or_default()
     if not tenant:
@@ -2008,6 +1950,7 @@ def email_sync():
 
 
 @app.route("/send-message", methods=["POST"])
+@app.route("/messages/send", methods=["POST"])
 def send_message():
     body = request.get_json(force=True, silent=True) or {}
     conversation_id = (body.get("conversationId") or body.get("conversation_id") or "").strip()
@@ -2017,29 +1960,64 @@ def send_message():
     payload_name = (body.get("name") or body.get("contact_name") or "").strip()
     payload_phone = normalize_phone(body.get("phone") or body.get("contact_phone") or "")
     payload_email = (body.get("email") or body.get("contact_email") or "").strip().lower()
-    if not conversation_id or not message:
-        return jsonify({"status": "error", "error": "conversationId en bericht zijn verplicht."}), 400
+    if not message:
+        return jsonify({"status": "error", "error": "Bericht ontbreekt."}), 400
+    if requested_channel and requested_channel not in ("sms", "email"):
+        return jsonify({"status": "error", "error": "Onbekend communicatiekanaal."}), 400
 
     try:
         ensure_conversation_tables()
+        row = None
+        if conversation_id:
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT tenant_id, contact_phone, contact_email, channel, subject FROM conversations WHERE id = %s LIMIT 1;",
+                        (conversation_id,),
+                    )
+                    row = cur.fetchone()
+
+        # Een lokaal gesprek kan nog een oud backend-ID bevatten na een deploy of reset.
+        # Maak in dat geval automatisch opnieuw het juiste backendgesprek aan.
+        if not row:
+            tenant = get_tenant_from_request_or_default()
+            if not tenant:
+                return jsonify({"status": "error", "error": "Geen platformtenant geselecteerd."}), 400
+            fallback_channel = requested_channel or ("email" if payload_email and not payload_phone else "sms")
+            if fallback_channel == "email" and not payload_email:
+                return jsonify({"status": "error", "error": "Geen e-mailadres gekoppeld aan dit gesprek."}), 400
+            if fallback_channel == "sms" and not payload_phone:
+                return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
+            conv = get_or_create_conversation(
+                tenant,
+                phone=payload_phone,
+                name=payload_name,
+                email=payload_email,
+                channel=fallback_channel,
+                subject=subject,
+            )
+            if not conv:
+                return jsonify({"status": "error", "error": "Gesprek kon niet opnieuw worden aangemaakt."}), 500
+            conversation_id = conv["id"]
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT tenant_id, contact_phone, contact_email, channel, subject FROM conversations WHERE id = %s LIMIT 1;",
+                        (conversation_id,),
+                    )
+                    row = cur.fetchone()
+
+        if not row:
+            return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
+
+        tenant_id, stored_phone, stored_email, stored_channel, stored_subject = row
+        channel = requested_channel or stored_channel or "sms"
+        phone = payload_phone or stored_phone or ""
+        email_address = payload_email or stored_email or ""
+        final_subject = subject or stored_subject or ""
+
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tenant_id, contact_phone, contact_email, channel, subject FROM conversations WHERE id = %s LIMIT 1;",
-                    (conversation_id,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
-
-                tenant_id, stored_phone, stored_email, stored_channel, stored_subject = row
-                channel = requested_channel or stored_channel or "sms"
-                phone = payload_phone or stored_phone or ""
-                email_address = payload_email or stored_email or ""
-                final_subject = subject or stored_subject or ""
-
-                # Contactgegevens en kanaal in dezelfde request bijwerken. Hierdoor is
-                # geen extra PATCH nodig en kan de AI-schakelaar het kanaal niet wijzigen.
                 cur.execute(
                     """
                     UPDATE conversations
@@ -2096,6 +2074,7 @@ def send_message():
                 "id": msg_id,
                 "conversationId": conversation_id,
                 "channel": channel,
+                "subject": final_subject if channel == "email" else "",
                 "status": "manual_overname",
                 "aiEnabled": False,
             },
