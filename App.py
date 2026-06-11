@@ -62,6 +62,9 @@ EMAIL_SYNC_LAST_RESULT: Dict[str, Dict[str, Any]] = {}
 EMAIL_REPLY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="reactify-email-reply")
 EMAIL_NETWORK_TIMEOUT = max(4, min(15, int(os.environ.get("EMAIL_NETWORK_TIMEOUT", "8"))))
 
+_CONVERSATION_TABLES_READY = False
+_CONVERSATION_TABLES_LOCK = threading.Lock()
+
 
 def log(msg: str) -> None:
     if DEBUG_LOGS:
@@ -413,12 +416,17 @@ def privacy_settings():
 # =========================
 
 def ensure_conversation_tables() -> None:
+    global _CONVERSATION_TABLES_READY
+    if _CONVERSATION_TABLES_READY:
+        return
     if not db_available():
         log("⚠️ DATABASE_URL missing; conversations disabled")
         return
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
+                cur.execute("SET LOCAL lock_timeout = '8s';")
+                cur.execute("SELECT pg_advisory_xact_lock(74201926);")
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS conversations (
@@ -495,9 +503,14 @@ def ensure_conversation_tables() -> None:
                       last_imap_uid BIGINT NOT NULL DEFAULT 0,
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                    ALTER TABLE conversations ADD COLUMN IF NOT EXISTS folder TEXT NOT NULL DEFAULT 'inbox';
+                    ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+                    UPDATE conversations SET folder = 'inbox' WHERE folder IS NULL OR folder = '';
+                    CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations (tenant_id, folder, updated_at DESC);
                     ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS last_imap_uid BIGINT NOT NULL DEFAULT 0;
                     """
                 )
+        _CONVERSATION_TABLES_READY = True
         log("✅ conversation tables ensured")
     except Exception as e:
         log(f"⚠️ ensure_conversation_tables failed: {e}")
@@ -611,7 +624,7 @@ def get_or_create_conversation(tenant: Dict[str, Any], phone: str = "", name: st
                     INSERT INTO conversations (id, tenant_id, contact_phone, contact_email, contact_name, channel, status, summary, subject, external_thread_id)
                     VALUES (%s, %s, %s, %s, %s, %s, 'ai-active', %s, %s, %s);
                 """, (conv_id, tenant_id, normalized_phone, normalized_email, display_name, normalized_channel, "", subject or "", external_thread_id or ""))
-                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": normalized_email, "channel": normalized_channel, "subject": subject, "status": "inactive"}
+                return {"id": conv_id, "tenant_id": tenant_id, "contact_phone": normalized_phone, "contact_name": display_name, "contact_email": normalized_email, "channel": normalized_channel, "subject": subject, "status": "ai-active", "folder": "inbox"}
     except Exception as e:
         log(f"⚠️ get_or_create_conversation failed: {e}")
         return None
@@ -1065,6 +1078,17 @@ def _process_email_auto_reply(
         log(f"⚠️ Achtergrondtaak automatisch e-mailantwoord mislukt: {exc}")
 
 
+def _email_is_spam_or_marketing(message, from_email: str, subject: str, text_body: str) -> bool:
+    headers = ' '.join([str(message.get('Auto-Submitted') or ''), str(message.get('Precedence') or ''), str(message.get('List-Unsubscribe') or ''), str(message.get('List-Id') or ''), str(message.get('X-Spam-Flag') or ''), str(message.get('X-Spam-Status') or '')]).lower()
+    haystack = (subject + '\n' + text_body[:2500]).lower()
+    sender = (from_email or '').lower()
+    hard_header = any(token in headers for token in ['yes', 'bulk', 'list-unsubscribe', 'auto-generated'])
+    automated_sender = any(token in sender for token in ['no-reply', 'noreply', 'newsletter', 'marketing', 'mailer-daemon'])
+    terms = ['unsubscribe', 'uitschrijven', 'nieuwsbrief', 'newsletter', 'promotie', 'promotion', 'korting', 'discount', 'aanbieding', 'sale', 'black friday', 'marketing', 'klik hier', 'view in browser', 'bekijk in browser', 'exclusieve deal']
+    score = sum(1 for term in terms if term in haystack)
+    return hard_header or (automated_sender and score >= 1) or score >= 3
+
+
 def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, Any]:
     """Synchroniseer recente mailboxberichten via IMAP UID.
 
@@ -1096,6 +1120,12 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             status, data = client.uid("search", None, f"UID {lookback_from}:*")
         else:
             status, data = client.uid("search", None, "ALL")
+            initial_ids = (data[0] or b"").split() if status == "OK" and data else []
+            baseline_uid = int(initial_ids[-1]) if initial_ids else 0
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE tenant_email_settings SET last_imap_uid = %s WHERE tenant_id = %s;", (baseline_uid, tenant["tenant_id"]))
+            return {"processed": 0, "replied": 0, "scanned": 0, "enabled": True, "initialized": True, "lastUid": baseline_uid}
         ids = (data[0] or b"").split() if status == "OK" and data else []
         ids = ids[-max(1, min(int(limit or 50) * 2, 150)):]
 
@@ -1130,6 +1160,7 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             text_body, html_body = _email_bodies(message)
             if not text_body:
                 continue
+            target_folder = "spam" if _email_is_spam_or_marketing(message, from_email, subject, text_body) else "inbox"
 
             conv = get_or_create_conversation(
                 tenant,
@@ -1142,6 +1173,9 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             if not conv:
                 log(f"⚠️ E-mailgesprek kon niet worden aangemaakt uid={numeric_uid}")
                 continue
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE conversations SET folder = %s, deleted_at = NULL WHERE id = %s AND tenant_id = %s;", (target_folder, conv["id"], tenant["tenant_id"]))
 
             inserted = add_conversation_message(
                 conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
@@ -1158,7 +1192,7 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             current_status = conv.get("status") or "ai-active"
             update_conversation_ai(conv["id"], analysis)
 
-            if is_ai_disabled_status(current_status) or analysis.get("requiresHuman") or not settings.get("autoReply"):
+            if target_folder == "spam" or is_ai_disabled_status(current_status) or analysis.get("requiresHuman") or not settings.get("autoReply"):
                 if analysis.get("requiresHuman"):
                     set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
                 continue
@@ -1680,24 +1714,22 @@ def conversations():
 
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
-            conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("conversation_id") or request.args.get("id") or "").strip()
-            phone = normalize_phone(body.get("phone") or body.get("contact_phone") or request.args.get("phone") or request.args.get("contact_phone") or "")
-            email = (body.get("email") or body.get("contact_email") or request.args.get("email") or request.args.get("contact_email") or "").strip().lower()
-            if not conversation_id and not phone and not email:
-                return jsonify({"status": "error", "error": "conversationId, telefoon of e-mail ontbreekt."}), 400
-            deleted_ids = []
+            action = (body.get("action") or request.args.get("action") or "trash").strip().lower()
+            conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
-                    if conversation_id:
+                    if action == "empty-trash":
+                        cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND folder = 'trash' RETURNING id;", (tenant["tenant_id"],))
+                        ids = [r[0] for r in cur.fetchall()]
+                        return jsonify({"status": "success", "data": {"emptied": len(ids), "ids": ids}}), 200
+                    if not conversation_id:
+                        return jsonify({"status": "error", "error": "conversationId ontbreekt."}), 400
+                    if action in ("permanent", "delete-permanently"):
                         cur.execute("DELETE FROM conversations WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
-                        deleted_ids.extend([r[0] for r in cur.fetchall()])
-                    if phone:
-                        cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND contact_phone = %s RETURNING id;", (tenant["tenant_id"], phone))
-                        deleted_ids.extend([r[0] for r in cur.fetchall()])
-                    if email:
-                        cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND LOWER(COALESCE(contact_email,'')) = %s RETURNING id;", (tenant["tenant_id"], email))
-                        deleted_ids.extend([r[0] for r in cur.fetchall()])
-            return jsonify({"status": "success", "data": {"deleted": True, "ids": list(dict.fromkeys(deleted_ids))}}), 200
+                    else:
+                        cur.execute("UPDATE conversations SET folder = 'trash', deleted_at = NOW(), updated_at = NOW() WHERE id = %s AND tenant_id = %s RETURNING id;", (conversation_id, tenant["tenant_id"]))
+                    ids = [r[0] for r in cur.fetchall()]
+            return jsonify({"status": "success", "data": {"deleted": True, "soft": action not in ("permanent", "delete-permanently"), "ids": ids}}), 200
 
         if request.method in ("PATCH", "POST"):
             body = request.get_json(force=True, silent=True) or {}
@@ -1709,6 +1741,9 @@ def conversations():
             requested_channel = (body.get("channel") or "").strip().lower()
             channel = requested_channel or ("sms" if request.method == "POST" else "")
             subject = (body.get("subject") or "").strip()
+            folder = (body.get("folder") or "").strip().lower()
+            if folder not in ("", "inbox", "spam", "trash"):
+                return jsonify({"status": "error", "error": "Ongeldige map."}), 400
 
             # POST zonder status = nieuw gesprek/contact aanmaken vanuit Reactify.
             if request.method == "POST" and not status and (phone or email or name):
@@ -1734,10 +1769,12 @@ def conversations():
                             contact_phone = COALESCE(NULLIF(%s, ''), contact_phone),
                             channel = COALESCE(NULLIF(%s, ''), channel),
                             subject = COALESCE(NULLIF(%s, ''), subject),
+                            folder = COALESCE(NULLIF(%s, ''), folder),
+                            deleted_at = CASE WHEN %s = 'trash' THEN NOW() WHEN %s IN ('inbox','spam') THEN NULL ELSE deleted_at END,
                             updated_at = NOW()
                         WHERE id = %s AND tenant_id = %s;
                         """,
-                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, conversation_id, tenant["tenant_id"]),
+                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, conversation_id, tenant["tenant_id"]),
                     )
 
             if status:
@@ -1748,7 +1785,10 @@ def conversations():
 
             return jsonify({"status": "success", "data": {"id": conversation_id, "status": status or None, "aiEnabled": None if requires_human is None else not requires_human}}), 200
 
-        limit = max(1, min(200, to_int_safe(request.args.get("limit"), 100)))
+        limit = max(1, min(500, to_int_safe(request.args.get("limit"), 100)))
+        requested_folder = (request.args.get("folder") or "inbox").strip().lower()
+        if requested_folder not in ("inbox", "spam", "trash", "all"):
+            requested_folder = "inbox"
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 # Herstel een succesvolle afspraak altijd naar Afgerond. Dit vangt ook
@@ -1801,7 +1841,7 @@ def conversations():
                 base_query = """
                     SELECT c.id, c.tenant_id, c.contact_phone, c.contact_email, c.contact_name,
                            c.channel, c.status, c.intent, c.urgency, c.requires_human, c.summary,
-                           c.recommended_action, c.suggested_reply, c.subject, c.external_thread_id, c.created_at, c.updated_at,
+                           c.recommended_action, c.suggested_reply, c.subject, c.external_thread_id, c.folder, c.deleted_at, c.created_at, c.updated_at,
                            lm.body AS last_message, lm.created_at AS last_message_at, lm.direction AS last_message_direction
                     FROM conversations c
                     LEFT JOIN LATERAL (
@@ -1809,7 +1849,10 @@ def conversations():
                       WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
                     ) lm ON TRUE
                 """
-                cur.execute(base_query + " WHERE c.tenant_id = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], limit))
+                if requested_folder == "all":
+                    cur.execute(base_query + " WHERE c.tenant_id = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], limit))
+                else:
+                    cur.execute(base_query + " WHERE c.tenant_id = %s AND c.folder = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], requested_folder, limit))
                 rows = cur.fetchall()
         data = []
         for r in rows:
@@ -1818,8 +1861,9 @@ def conversations():
                 "contact_name": r[4] or r[2] or "Onbekende klant", "channel": r[5] or "sms", "status": r[6] or "ai-active",
                 "intent": r[7] or "", "urgency": r[8] or "", "requires_human": bool(r[9]), "summary": r[10] or "",
                 "recommended_action": r[11] or "", "suggested_reply": r[12] or "", "subject": r[13] or "", "external_thread_id": r[14] or "",
-                "created_at": r[15].isoformat() if r[15] else None, "updated_at": r[16].isoformat() if r[16] else None,
-                "last_message": r[17] or "", "last_message_at": r[18].isoformat() if r[18] else None, "last_message_direction": r[19] or "",
+                "folder": r[15] or "inbox", "deleted_at": r[16].isoformat() if r[16] else None,
+                "created_at": r[17].isoformat() if r[17] else None, "updated_at": r[18].isoformat() if r[18] else None,
+                "last_message": r[19] or "", "last_message_at": r[20].isoformat() if r[20] else None, "last_message_direction": r[21] or "",
             })
         return jsonify({"status": "success", "data": data}), 200
     except Exception as e:
