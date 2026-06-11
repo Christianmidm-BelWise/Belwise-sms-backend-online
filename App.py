@@ -1515,18 +1515,8 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                         (target_folder, target_folder, target_folder, conv["id"], tenant["tenant_id"]),
                     )
 
-            inserted = add_conversation_message(
-                conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
-                external_id=external_id, sender_type="customer", subject=subject,
-                html_body=html_body, external_thread_id=external_thread_id,
-                in_reply_to=in_reply_to,
-            )
-            if not inserted:
-                # Reeds geïmporteerd; dit is normaal door de UID-lookback.
-                continue
-
-            # Wanneer de afzenderheader geen bruikbare naam bevat, haal de naam uit
-            # bijvoorbeeld "Met vriendelijke groeten,\nVoornaam Achternaam".
+            # Herken en bewaar de naam vóór de duplicate-check. Daardoor wordt ook een
+            # reeds geïmporteerde mail hersteld wanneer de naamherkenning later verbeterd is.
             signature_name = extract_name_from_email_signature(text_body)
             context_name = get_name_from_recent_outgoing_email(conv["id"])
             detected_name = signature_name or context_name
@@ -1535,6 +1525,16 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                     conv["id"], tenant["tenant_id"], detected_name
                 )
                 conv["contact_name"] = detected_name
+
+            inserted = add_conversation_message(
+                conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
+                external_id=external_id, sender_type="customer", subject=subject,
+                html_body=html_body, external_thread_id=external_thread_id,
+                in_reply_to=in_reply_to,
+            )
+            if not inserted:
+                # Reeds geïmporteerd; de profielnaam is hierboven wel opnieuw gecontroleerd.
+                continue
 
             processed += 1
             analysis = classify_text_basic(subject + "\n" + text_body)
@@ -1833,6 +1833,62 @@ def update_email_contact_name_from_signature(conversation_id: str, tenant_id: st
                 """, (name, conversation_id, tenant_id, name))
     except Exception as exc:
         log(f"⚠️ Naam uit e-mailhandtekening opslaan mislukt: {exc}")
+
+
+def repair_email_contact_names_from_messages(tenant_id: str, limit: int = 100) -> int:
+    """Herstel generieke e-mailprofielen vanuit opgeslagen inkomende handtekeningen.
+
+    Dit draait lichtgewicht bij het ophalen van de inbox en maakt de naamherkenning
+    onafhankelijk van het moment waarop de IMAP-mail oorspronkelijk is geïmporteerd.
+    Handmatig ingestelde, niet-generieke namen worden nooit overschreven.
+    """
+    if not db_available() or not tenant_id:
+        return 0
+    repaired = 0
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT c.id, m.body
+                    FROM conversations c
+                    JOIN LATERAL (
+                        SELECT body
+                        FROM conversation_messages
+                        WHERE conversation_id = c.id
+                          AND tenant_id = c.tenant_id
+                          AND channel = 'email'
+                          AND direction = 'incoming'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    ) m ON TRUE
+                    WHERE c.tenant_id = %s
+                      AND c.channel = 'email'
+                      AND (
+                        c.contact_name IS NULL OR BTRIM(c.contact_name) = '' OR
+                        LOWER(BTRIM(c.contact_name)) IN (
+                          'nieuwe lead','nieuwe klant','onbekende klant','onbekend',
+                          'klant','lead','geen naam','unknown','new lead','customer'
+                        ) OR
+                        c.contact_name LIKE '%%@%%' OR
+                        LOWER(REGEXP_REPLACE(COALESCE(c.contact_name,''), '[^a-z0-9]', '', 'g')) =
+                        LOWER(REGEXP_REPLACE(SPLIT_PART(COALESCE(c.contact_email,''), '@', 1), '[^a-z0-9]', '', 'g'))
+                      )
+                    ORDER BY c.updated_at DESC
+                    LIMIT %s;
+                """, (tenant_id, max(1, min(int(limit or 100), 500))))
+                rows = cur.fetchall()
+
+        for conversation_id, body in rows:
+            detected = extract_name_from_email_signature(body or "")
+            if not detected:
+                continue
+            update_email_contact_name_from_signature(conversation_id, tenant_id, detected)
+            repaired += 1
+        if repaired:
+            log(f"✅ {repaired} e-mailprofielna(a)m(en) hersteld uit handtekening")
+    except Exception as exc:
+        log(f"⚠️ Automatisch herstel e-mailprofielnamen mislukt: {exc}")
+    return repaired
 
 
 def extract_contact_details(text: str) -> Dict[str, str]:
@@ -2231,6 +2287,8 @@ def conversations():
         # Plan hoogstens een achtergrondsync; de gesprekkenlijst antwoordt direct.
         if request.method == "GET":
             schedule_email_sync(tenant, min_interval_seconds=30, force=False)
+            # Herstel ook bestaande profielen waarvan de mail al eerder was opgeslagen.
+            repair_email_contact_names_from_messages(tenant["tenant_id"], limit=150)
 
         if request.method == "DELETE":
             body = request.get_json(force=True, silent=True) or {}
