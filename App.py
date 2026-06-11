@@ -60,6 +60,7 @@ EMAIL_SYNC_RUNNING = set()
 EMAIL_SYNC_LAST_RUN: Dict[str, datetime] = {}
 EMAIL_SYNC_LAST_RESULT: Dict[str, Dict[str, Any]] = {}
 EMAIL_REPLY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="reactify-email-reply")
+SMS_REPLY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reactify-sms-reply")
 EMAIL_NETWORK_TIMEOUT = max(4, min(15, int(os.environ.get("EMAIL_NETWORK_TIMEOUT", "8"))))
 APP_STARTED_AT = datetime.now(timezone.utc)
 EMAIL_SYNC_EPOCH = (
@@ -531,6 +532,14 @@ def ensure_conversation_tables() -> None:
                       sent_at TIMESTAMPTZ,
                       PRIMARY KEY (tenant_id, external_id)
                     );
+                    CREATE TABLE IF NOT EXISTS sms_inbound_claims (
+                      tenant_id TEXT NOT NULL,
+                      external_id TEXT NOT NULL,
+                      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      PRIMARY KEY (tenant_id, external_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_sms_inbound_claims_claimed_at
+                      ON sms_inbound_claims (claimed_at);
                     """
                 )
         _CONVERSATION_TABLES_READY = True
@@ -1739,6 +1748,128 @@ def get_or_create_chat_id(tenant: Dict[str, Any], contact_key: str) -> Optional[
     return None
 
 
+def ask_retell_via_sms(tenant: Dict[str, Any], phone_number: str, text: str) -> str:
+    """Vraag Retell om één SMS-antwoord voor de bestaande contactsessie."""
+    opening = tenant.get("opening_line") or "Bedankt voor je bericht. Hoe kan ik helpen?"
+    if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
+        return opening
+    contact_key = normalize_phone(phone_number)
+    chat_id = get_or_create_chat_id(tenant, contact_key)
+    if not chat_id:
+        return opening
+    try:
+        response = requests.post(
+            f"{RETELL_BASE_URL}/create-chat-completion",
+            headers={"Authorization": f"Bearer {RETELL_API_KEY}", "Content-Type": "application/json"},
+            json={"chat_id": chat_id, "content": (text or "").strip()},
+            timeout=12,
+        )
+        data = response.json() if response.content else {}
+        if not response.ok:
+            log(f"⚠️ Retell SMS completion failed status={response.status_code}: {str(data)[:300]}")
+            return opening
+        for message in reversed(data.get("messages", [])):
+            if message.get("role") == "agent":
+                answer = (message.get("content") or "").strip()
+                if answer:
+                    return answer
+    except Exception as exc:
+        log(f"⚠️ Retell SMS completion error: {exc}")
+    return opening
+
+
+def _sms_external_id(event: Dict[str, Any], sender: str, receiver: str, text: str) -> str:
+    msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+    candidates = [
+        msg.get("id"), msg.get("message_id"), msg.get("messageId"), msg.get("uuid"),
+        event.get("id"), event.get("message_id"), event.get("messageId"), event.get("uuid"),
+    ]
+    for value in candidates:
+        value = str(value or "").strip()
+        if value:
+            return "provider:" + value
+    # Bij providers zonder expliciet bericht-ID blijft dezelfde webhookpayload identiek.
+    canonical = json.dumps(event, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    raw = f"{normalize_phone(sender)}|{normalize_phone(receiver)}|{text.strip()}|{canonical}"
+    return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _claim_sms_inbound(tenant_id: str, external_id: str) -> bool:
+    if not db_available():
+        return True
+    ensure_conversation_tables()
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sms_inbound_claims (tenant_id, external_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING external_id;
+                    """,
+                    (tenant_id, external_id),
+                )
+                return cur.fetchone() is not None
+    except Exception as exc:
+        log(f"⚠️ SMS inbound claim failed; processing continues: {exc}")
+        return True
+
+
+def _process_sms_inbound(tenant: Dict[str, Any], sender: str, text: str) -> None:
+    try:
+        conv = get_or_create_conversation(tenant, phone=sender, channel="sms")
+        analysis = classify_text_basic(text)
+        current_status = (conv or {}).get("status") or "ai-active"
+
+        if conv:
+            inserted = add_conversation_message(
+                conv["id"], tenant["tenant_id"], "incoming", text, "sms", sender_type="customer"
+            )
+            if not inserted:
+                log(f"ℹ️ Duplicate SMS message ignored conversation={conv['id']}")
+                return
+            details = extract_contact_details(text)
+            if details.get("name") or details.get("email"):
+                update_conversation_contact(conv["id"], tenant["tenant_id"], details.get("name", ""), details.get("email", ""))
+            recent = get_recent_conversation_messages(conv["id"], 16)
+            conversation_text = " ".join(m.get("body", "") for m in recent if m.get("body"))
+            analysis = classify_text_basic(conversation_text or text)
+
+            if is_ai_disabled_status(current_status):
+                set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
+                log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
+                return
+
+            update_conversation_ai(conv["id"], analysis)
+            if analysis.get("requiresHuman"):
+                set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
+                log(f"🤝 Human takeover required for conversation={conv['id']}; Retell skipped")
+                return
+            set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
+
+        reply = ask_retell_via_sms(tenant, sender, text)
+        if conv:
+            stall_reason = detect_ai_stall(conv["id"], reply)
+            if stall_reason:
+                mark_ai_takeover_needed(conv["id"], tenant["tenant_id"], stall_reason)
+                log(f"⚠️ AI stall detected conversation={conv['id']}: {stall_reason}")
+                return
+
+        sent = bool(reply) and send_sms(tenant, sender, reply)
+        if conv and reply and sent:
+            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms", sender_type="ai")
+            if reply_confirms_booking(reply):
+                mark_conversation_completed(conv["id"], tenant["tenant_id"])
+                end_retell_chat(tenant, sender)
+            else:
+                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
+        elif conv and reply and not sent:
+            mark_ai_takeover_needed(conv["id"], tenant["tenant_id"], "SMS kon niet worden verzonden.")
+    except Exception as exc:
+        log(f"❌ Background SMS answer failed: {exc}")
+
+
 def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: str, text: str) -> str:
     opening = tenant.get("opening_line") or "Bedankt voor uw e-mail."
     if not RETELL_API_KEY or not tenant.get("retell_agent_id"):
@@ -2203,64 +2334,21 @@ def sms_inbound():
     receiver = (msg.get("receiver") or event.get("receiver") or "").strip()
     sender = (msg.get("sender") or event.get("sender") or event.get("from") or "").strip()
     text = (msg.get("content") or event.get("content") or event.get("text") or "").strip()
-
     tenant = get_tenant_by_receiver(receiver)
     if not tenant:
         log(f"⚠️ /sms/inbound: no tenant for receiver={receiver}")
         return "OK", 200
+    if not sender or not text:
+        return "OK", 200
 
-    if sender and text:
-        conv = get_or_create_conversation(tenant, phone=sender, channel="sms")
-        analysis = classify_text_basic(text)
-        current_status = (conv or {}).get("status") or "ai-active"
+    external_id = _sms_external_id(event, sender, receiver, text)
+    if not _claim_sms_inbound(tenant["tenant_id"], external_id):
+        log(f"ℹ️ Duplicate SMS webhook ignored external_id={external_id}")
+        return "OK", 200
 
-        if conv:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text, "sms", sender_type="customer")
-            details = extract_contact_details(text)
-            if details.get("name") or details.get("email"):
-                update_conversation_contact(conv["id"], tenant["tenant_id"], details.get("name", ""), details.get("email", ""))
-            # Bouw samenvatting, urgentie en aanbevolen actie op uit de recente conversatie,
-            # niet alleen uit het allerlaatste bericht.
-            recent = get_recent_conversation_messages(conv["id"], 16)
-            conversation_text = " ".join(m.get("body", "") for m in recent if m.get("body"))
-            analysis = classify_text_basic(conversation_text or text)
-
-            # Alleen een echte handmatige overname, expliciete overnamevraag of afgesloten gesprek blokkeert AI.
-            # 'inactive' betekent enkel dat er nog geen activiteit was en mag een eerste antwoord nooit blokkeren.
-            if is_ai_disabled_status(current_status):
-                set_conversation_status(conv["id"], tenant["tenant_id"], current_status, True)
-                log(f"🤝 AI disabled for conversation={conv['id']} status={current_status}; inbound saved only")
-                return "OK", 200
-
-            # Zodra een klant bericht en AI aan staat, is het gesprek actief.
-            update_conversation_ai(conv["id"], analysis)
-            if analysis.get("requiresHuman"):
-                set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
-                log(f"🤝 Human takeover required for conversation={conv['id']}; Retell skipped")
-                return "OK", 200
-            set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
-
-        reply = ask_retell_via_sms(tenant, sender, text)
-
-        if conv:
-            stall_reason = detect_ai_stall(conv["id"], reply)
-            if stall_reason:
-                mark_ai_takeover_needed(conv["id"], tenant["tenant_id"], stall_reason)
-                log(f"⚠️ AI stall detected conversation={conv['id']}: {stall_reason}")
-                return "OK", 200
-
-        if reply:
-            send_sms(tenant, sender, reply)
-
-        if conv and reply:
-            add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "sms", sender_type="ai")
-            if reply_confirms_booking(reply):
-                mark_conversation_completed(conv["id"], tenant["tenant_id"])
-                end_retell_chat(tenant, sender)
-                log(f"✅ Booking confirmed; conversation completed and Retell chat ended conversation={conv['id']}")
-            else:
-                set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
-
+    # Antwoord onmiddellijk 200 aan de SMS-provider. Retell en Smstools draaien
+    # in de achtergrond, zodat een trage AI-call geen webhook-herhalingen veroorzaakt.
+    SMS_REPLY_EXECUTOR.submit(_process_sms_inbound, tenant, sender, text)
     return "OK", 200
 
 
