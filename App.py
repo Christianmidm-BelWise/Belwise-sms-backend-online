@@ -12,7 +12,7 @@ import hashlib
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
-from email.utils import parseaddr, formataddr, make_msgid
+from email.utils import parseaddr, formataddr, make_msgid, format_datetime
 from html import unescape
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
@@ -485,8 +485,10 @@ def ensure_conversation_tables() -> None:
                       password_encrypted TEXT NOT NULL DEFAULT '',
                       signature TEXT NOT NULL DEFAULT '',
                       auto_reply BOOLEAN NOT NULL DEFAULT TRUE,
+                      last_imap_uid BIGINT NOT NULL DEFAULT 0,
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                    ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS last_imap_uid BIGINT NOT NULL DEFAULT 0;
                     """
                 )
         log("✅ conversation tables ensured")
@@ -861,7 +863,7 @@ def get_email_settings(tenant_id: str, include_password: bool = False) -> Option
             cur.execute("""
                 SELECT enabled, email_address, sender_name, imap_host, imap_port, imap_security,
                        smtp_host, smtp_port, smtp_security, username, password_encrypted,
-                       signature, auto_reply, updated_at
+                       signature, auto_reply, last_imap_uid, updated_at
                 FROM tenant_email_settings WHERE tenant_id = %s;
             """, (tenant_id,))
             row = cur.fetchone()
@@ -872,7 +874,7 @@ def get_email_settings(tenant_id: str, include_password: bool = False) -> Option
         "imapHost": row[3] or "", "imapPort": int(row[4] or 993), "imapSecurity": row[5] or "ssl",
         "smtpHost": row[6] or "", "smtpPort": int(row[7] or 587), "smtpSecurity": row[8] or "starttls",
         "username": row[9] or "", "hasPassword": bool(row[10]), "signature": row[11] or "",
-        "autoReply": bool(row[12]), "updatedAt": row[13].isoformat() if row[13] else None,
+        "autoReply": bool(row[12]), "lastImapUid": int(row[13] or 0), "updatedAt": row[14].isoformat() if row[14] else None,
     }
     if include_password:
         result["password"] = decrypt_email_secret(row[10] or "")
@@ -947,6 +949,8 @@ def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body
     msg["From"] = formataddr((settings.get("senderName") or tenant.get("company_name") or "", sender_address))
     msg["To"] = to_email
     msg["Subject"] = subject or "Bericht van " + (tenant.get("company_name") or "Reactify")
+    msg["Date"] = format_datetime(datetime.now(timezone.utc))
+    msg["Reply-To"] = sender_address
     external_id = make_msgid(domain=sender_address.split("@")[-1] if "@" in sender_address else None)
     msg["Message-ID"] = external_id
     if in_reply_to:
@@ -960,15 +964,15 @@ def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body
         host, port = settings["smtpHost"], int(settings.get("smtpPort") or 587)
         security = (settings.get("smtpSecurity") or "starttls").lower()
         if security == "ssl":
-            smtp = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30)
+            smtp = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=15)
         else:
-            smtp = smtplib.SMTP(host, port, timeout=30)
+            smtp = smtplib.SMTP(host, port, timeout=15)
             smtp.ehlo()
             if security == "starttls":
                 smtp.starttls(context=ssl.create_default_context())
                 smtp.ehlo()
         smtp.login(settings.get("username") or sender_address, settings.get("password") or "")
-        smtp.send_message(msg)
+        smtp.send_message(msg, from_addr=sender_address, to_addrs=[to_email])
         smtp.quit()
         return True, external_id, ""
     except Exception as exc:
@@ -991,36 +995,59 @@ def _last_email_thread_headers(conversation_id: str) -> Tuple[str, str]:
     return message_id, message_id
 
 
-def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, Any]:
+def sync_incoming_email(tenant: Dict[str, Any], limit: int = 50) -> Dict[str, Any]:
+    """Synchroniseer nieuwe mailboxberichten op IMAP UID in plaats van alleen UNSEEN.
+
+    Hierdoor komen ook berichten binnen die door one.com Webmail of een andere
+    mailclient al als gelezen zijn gemarkeerd. De mailboxstatus zelf wordt niet
+    aangepast; deduplicatie gebeurt via Message-ID en de unieke database-index.
+    """
     settings = get_email_settings(tenant["tenant_id"], include_password=True)
     if not settings or not settings.get("enabled"):
         return {"processed": 0, "replied": 0, "enabled": False}
     if not EMAIL_SYNC_LOCK.acquire(blocking=False):
         return {"processed": 0, "replied": 0, "busy": True, "enabled": True}
+
     processed = replied = 0
     client = None
+    highest_uid = int(settings.get("lastImapUid") or 0)
     try:
         client = _imap_connect(settings)
-        client.select("INBOX")
-        status, data = client.search(None, "UNSEEN")
+        status, _ = client.select("INBOX", readonly=True)
         if status != "OK":
             return {"processed": 0, "replied": 0, "enabled": True}
-        ids = (data[0] or b"").split()[-max(1, min(limit, 100)):]
-        for item_id in ids:
-            status, rows = client.fetch(item_id, "(RFC822)")
+
+        if highest_uid > 0:
+            status, data = client.uid("search", None, f"UID {highest_uid + 1}:*")
+            ids = (data[0] or b"").split() if status == "OK" and data else []
+        else:
+            # Eerste synchronisatie: importeer alleen de meest recente berichten.
+            status, data = client.uid("search", None, "ALL")
+            ids = (data[0] or b"").split()[-max(1, min(limit, 100)):] if status == "OK" and data else []
+
+        ids = ids[-max(1, min(limit, 100)):]
+        for uid_value in ids:
+            try:
+                numeric_uid = int(uid_value)
+            except Exception:
+                numeric_uid = highest_uid
+
+            status, rows = client.uid("fetch", uid_value, "(RFC822)")
             if status != "OK" or not rows:
                 continue
             raw = next((row[1] for row in rows if isinstance(row, tuple) and len(row) > 1), None)
             if not raw:
                 continue
+            highest_uid = max(highest_uid, numeric_uid)
+
             message = BytesParser(policy=policy.default).parsebytes(raw)
             from_name, from_email = parseaddr(str(message.get("From") or ""))
             from_email = from_email.strip().lower()
             own_email = (settings.get("emailAddress") or "").strip().lower()
             if not from_email or from_email == own_email:
-                client.store(item_id, "+FLAGS", "\\Seen")
                 continue
-            external_id = str(message.get("Message-ID") or "").strip() or f"imap:{item_id.decode(errors='ignore')}"
+
+            external_id = str(message.get("Message-ID") or "").strip() or f"imap-uid:{numeric_uid}"
             subject = str(message.get("Subject") or "").strip() or "Zonder onderwerp"
             normalized_subject = _normalized_subject(subject)
             in_reply_to = str(message.get("In-Reply-To") or "").strip()
@@ -1028,35 +1055,66 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             external_thread_id = in_reply_to or (references.split()[0] if references else "") or normalized_subject
             text_body, html_body = _email_bodies(message)
             if not text_body:
-                client.store(item_id, "+FLAGS", "\\Seen")
                 continue
-            conv = get_or_create_conversation(tenant, name=from_name or from_email, email=from_email, channel="email", subject=normalized_subject, external_thread_id=external_thread_id)
+
+            conv = get_or_create_conversation(
+                tenant,
+                name=from_name or from_email,
+                email=from_email,
+                channel="email",
+                subject=normalized_subject,
+                external_thread_id=external_thread_id,
+            )
             if not conv:
                 continue
-            inserted = add_conversation_message(conv["id"], tenant["tenant_id"], "incoming", text_body, "email", external_id=external_id, sender_type="customer", subject=subject, html_body=html_body, external_thread_id=external_thread_id, in_reply_to=in_reply_to)
-            client.store(item_id, "+FLAGS", "\\Seen")
+
+            inserted = add_conversation_message(
+                conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
+                external_id=external_id, sender_type="customer", subject=subject,
+                html_body=html_body, external_thread_id=external_thread_id,
+                in_reply_to=in_reply_to,
+            )
             if not inserted:
                 continue
+
             processed += 1
             analysis = classify_text_basic(subject + "\n" + text_body)
             current_status = conv.get("status") or "ai-active"
             update_conversation_ai(conv["id"], analysis)
+
             if is_ai_disabled_status(current_status) or analysis.get("requiresHuman") or not settings.get("autoReply"):
                 if analysis.get("requiresHuman"):
                     set_conversation_status(conv["id"], tenant["tenant_id"], "menselijke_overname", True)
                 continue
+
             reply = ask_retell_via_email(tenant, from_email, subject, text_body)
             if not reply:
                 continue
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-            ok, sent_id, error = send_email_message(tenant, from_email, reply_subject, reply, in_reply_to=external_id, references=(references + " " + external_id).strip())
+            ok, sent_id, error = send_email_message(
+                tenant, from_email, reply_subject, reply,
+                in_reply_to=external_id,
+                references=(references + " " + external_id).strip(),
+            )
             if ok:
-                add_conversation_message(conv["id"], tenant["tenant_id"], "outgoing", reply, "email", external_id=sent_id, sender_type="ai", subject=reply_subject, external_thread_id=external_thread_id, in_reply_to=external_id)
+                add_conversation_message(
+                    conv["id"], tenant["tenant_id"], "outgoing", reply, "email",
+                    external_id=sent_id, sender_type="ai", subject=reply_subject,
+                    external_thread_id=external_thread_id, in_reply_to=external_id,
+                )
                 set_conversation_status(conv["id"], tenant["tenant_id"], "ai-active", False)
                 replied += 1
             else:
                 log(f"⚠️ Automatic email reply failed: {error}")
-        return {"processed": processed, "replied": replied, "enabled": True}
+
+        if highest_uid > int(settings.get("lastImapUid") or 0):
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE tenant_email_settings SET last_imap_uid = %s WHERE tenant_id = %s;",
+                        (highest_uid, tenant["tenant_id"]),
+                    )
+        return {"processed": processed, "replied": replied, "enabled": True, "lastUid": highest_uid}
     finally:
         try:
             if client:
@@ -1614,7 +1672,8 @@ def conversations():
             phone = body.get("phone") or body.get("contact_phone") or body.get("to") or ""
             name = body.get("name") or body.get("contact_name") or body.get("customerName") or ""
             email = body.get("email") or body.get("contact_email") or body.get("customerEmail") or ""
-            channel = (body.get("channel") or "sms").strip().lower()
+            requested_channel = (body.get("channel") or "").strip().lower()
+            channel = requested_channel or ("sms" if request.method == "POST" else "")
             subject = (body.get("subject") or "").strip()
 
             # POST zonder status = nieuw gesprek/contact aanmaken vanuit Reactify.
@@ -1955,45 +2014,99 @@ def send_message():
     message = (body.get("message") or body.get("text") or "").strip()
     requested_channel = (body.get("channel") or "").strip().lower()
     subject = (body.get("subject") or "").strip()
+    payload_name = (body.get("name") or body.get("contact_name") or "").strip()
+    payload_phone = normalize_phone(body.get("phone") or body.get("contact_phone") or "")
+    payload_email = (body.get("email") or body.get("contact_email") or "").strip().lower()
     if not conversation_id or not message:
         return jsonify({"status": "error", "error": "conversationId en bericht zijn verplicht."}), 400
+
     try:
         ensure_conversation_tables()
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT tenant_id, contact_phone, contact_email, channel, subject FROM conversations WHERE id = %s LIMIT 1;", (conversation_id,))
+                cur.execute(
+                    "SELECT tenant_id, contact_phone, contact_email, channel, subject FROM conversations WHERE id = %s LIMIT 1;",
+                    (conversation_id,),
+                )
                 row = cur.fetchone()
-        if not row:
-            return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
-        tenant_id, phone, email_address, stored_channel, stored_subject = row
+                if not row:
+                    return jsonify({"status": "error", "error": "Gesprek niet gevonden."}), 404
+
+                tenant_id, stored_phone, stored_email, stored_channel, stored_subject = row
+                channel = requested_channel or stored_channel or "sms"
+                phone = payload_phone or stored_phone or ""
+                email_address = payload_email or stored_email or ""
+                final_subject = subject or stored_subject or ""
+
+                # Contactgegevens en kanaal in dezelfde request bijwerken. Hierdoor is
+                # geen extra PATCH nodig en kan de AI-schakelaar het kanaal niet wijzigen.
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET contact_name = COALESCE(NULLIF(%s, ''), contact_name),
+                        contact_phone = COALESCE(NULLIF(%s, ''), contact_phone),
+                        contact_email = COALESCE(NULLIF(%s, ''), contact_email),
+                        channel = %s,
+                        subject = COALESCE(NULLIF(%s, ''), subject),
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (payload_name, phone, email_address, channel, final_subject, conversation_id),
+                )
+
         tenant = TENANTS_BY_ID.get(tenant_id)
         if not tenant:
             return jsonify({"status": "error", "error": "Tenant niet gevonden."}), 404
-        channel = requested_channel or stored_channel or "sms"
+
         if channel == "email":
             if not email_address:
                 return jsonify({"status": "error", "error": "Geen e-mailadres gekoppeld aan dit gesprek."}), 400
-            final_subject = subject or stored_subject or "Bericht van " + (tenant.get("company_name") or "Reactify")
+            final_subject = final_subject or "Bericht van " + (tenant.get("company_name") or "Reactify")
             in_reply_to, references = _last_email_thread_headers(conversation_id)
-            ok, external_id, error = send_email_message(tenant, email_address, final_subject, message, in_reply_to=in_reply_to, references=references)
+            ok, external_id, send_error = send_email_message(
+                tenant, email_address, final_subject, message,
+                in_reply_to=in_reply_to, references=references,
+            )
             if not ok:
-                return jsonify({"status": "error", "error": "E-mail verzenden mislukt.", "details": error}), 502
-            msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "email", external_id=external_id, sender_type="manual", subject=final_subject, in_reply_to=in_reply_to)
-            with psycopg2.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE conversations SET channel='email', subject=%s WHERE id=%s;", (final_subject, conversation_id))
+                detail = send_error or "Onbekende SMTP-fout"
+                return jsonify({
+                    "status": "error",
+                    "error": f"E-mail verzenden mislukt: {detail}",
+                    "details": detail,
+                }), 502
+            msg_id = add_conversation_message(
+                conversation_id, tenant_id, "outgoing", message, "email",
+                external_id=external_id, sender_type="manual",
+                subject=final_subject, in_reply_to=in_reply_to,
+            )
         else:
             if not phone:
                 return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
             if not send_sms(tenant, normalize_phone(phone), message):
                 return jsonify({"status": "error", "error": "SMSTools kon de SMS niet verzenden."}), 502
-            msg_id = add_conversation_message(conversation_id, tenant_id, "outgoing", message, "sms", sender_type="manual")
+            msg_id = add_conversation_message(
+                conversation_id, tenant_id, "outgoing", message, "sms", sender_type="manual"
+            )
             channel = "sms"
+
         set_conversation_status(conversation_id, tenant_id, "manual_overname", True)
-        return jsonify({"status": "success", "data": {"id": msg_id, "conversationId": conversation_id, "channel": channel, "status": "manual_overname", "aiEnabled": False}}), 200
+        return jsonify({
+            "status": "success",
+            "data": {
+                "id": msg_id,
+                "conversationId": conversation_id,
+                "channel": channel,
+                "status": "manual_overname",
+                "aiEnabled": False,
+            },
+        }), 200
     except Exception as exc:
         log(f"❌ /send-message error: {exc}")
-        return jsonify({"status": "error", "error": "Bericht verzenden mislukt.", "details": str(exc)}), 500
+        return jsonify({
+            "status": "error",
+            "error": f"Bericht verzenden mislukt: {exc}",
+            "details": str(exc),
+        }), 500
 
 
 @app.route("/classify-conversation", methods=["POST"])
