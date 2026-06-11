@@ -1166,7 +1166,7 @@ def _imap_connect(settings: Dict[str, Any]):
     return client
 
 
-def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body: str, in_reply_to: str = "", references: str = "") -> Tuple[bool, str, str]:
+def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body: str, in_reply_to: str = "", references: str = "", attachments: Optional[list] = None) -> Tuple[bool, str, str]:
     settings = get_email_settings(tenant["tenant_id"], include_password=True)
     if not settings or not settings.get("enabled"):
         return False, "", "E-mailkanaal is niet geconfigureerd of staat uit."
@@ -1193,6 +1193,34 @@ def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body
     ))
     full_body = clean_body if (not signature or has_closing) else clean_body + "\n\n" + signature
     msg.set_content(full_body)
+
+    # Bijlagen worden uitsluitend voor e-mail ondersteund. De browser stuurt
+    # kleine bestanden als base64 mee; hier valideren en voegen we ze veilig toe.
+    safe_attachments = attachments if isinstance(attachments, list) else []
+    if len(safe_attachments) > 5:
+        return False, "", "Maximaal 5 bijlagen per e-mail toegestaan."
+    total_bytes = 0
+    for item in safe_attachments:
+        if not isinstance(item, dict):
+            return False, "", "Ongeldige bijlage."
+        filename = os.path.basename(str(item.get("name") or "bijlage"))[:180]
+        encoded = str(item.get("data") or "")
+        if encoded.startswith("data:") and "," in encoded:
+            encoded = encoded.split(",", 1)[1]
+        try:
+            file_bytes = base64.b64decode(encoded, validate=True)
+        except Exception:
+            return False, "", f"Bijlage '{filename}' kon niet worden gelezen."
+        total_bytes += len(file_bytes)
+        if len(file_bytes) > 3 * 1024 * 1024:
+            return False, "", f"Bijlage '{filename}' is groter dan 3 MB."
+        if total_bytes > 4 * 1024 * 1024:
+            return False, "", "De bijlagen samen mogen maximaal 4 MB zijn."
+        content_type = str(item.get("type") or "application/octet-stream").lower()
+        maintype, _, subtype = content_type.partition("/")
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=filename)
     try:
         host, port = settings["smtpHost"], int(settings.get("smtpPort") or 587)
         security = (settings.get("smtpSecurity") or "starttls").lower()
@@ -2862,6 +2890,7 @@ def send_message():
     payload_name = (body.get("name") or body.get("contact_name") or "").strip()
     payload_phone = normalize_phone(body.get("phone") or body.get("contact_phone") or "")
     payload_email = (body.get("email") or body.get("contact_email") or "").strip().lower()
+    attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
     if not message:
         return jsonify({"status": "error", "error": "Bericht ontbreekt."}), 400
     if requested_channel and requested_channel not in ("sms", "email"):
@@ -2946,6 +2975,7 @@ def send_message():
             ok, external_id, send_error = send_email_message(
                 tenant, email_address, final_subject, message,
                 in_reply_to=in_reply_to, references=references,
+                attachments=attachments,
             )
             if not ok:
                 detail = send_error or "Onbekende SMTP-fout"
@@ -2960,6 +2990,8 @@ def send_message():
                 subject=final_subject, in_reply_to=in_reply_to,
             )
         else:
+            if attachments:
+                return jsonify({"status": "error", "error": "Bijlagen worden alleen bij e-mail ondersteund."}), 400
             if not phone:
                 return jsonify({"status": "error", "error": "Geen telefoonnummer gekoppeld aan dit gesprek."}), 400
             if not send_sms(tenant, normalize_phone(phone), message):
