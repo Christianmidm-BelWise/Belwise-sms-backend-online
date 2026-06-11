@@ -1367,6 +1367,7 @@ def _process_email_auto_reply(
         if not reply:
             _release_email_auto_reply_claim(tenant_id, external_id)
             return
+        reply = repair_generic_email_reply(text_body, reply)
         reply = ensure_ai_email_closing(reply)
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         ok, sent_id, error = send_email_message(
@@ -1772,6 +1773,30 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
     except Exception as exc:
         log(f"⚠️ Retell email completion error: {exc}")
     return opening
+
+def repair_generic_email_reply(customer_text: str, reply: str) -> str:
+    """Vervang alleen een inhoudsloze standaardreactie wanneer de klantvraag al duidelijk is."""
+    customer = (customer_text or "").strip()
+    answer = (reply or "").strip()
+    generic = bool(re.search(
+        r"(?i)\b(hoe kan ik (je|u) helpen|waarmee kan ik (je|u) helpen|wat kan ik voor (je|u) doen)\b",
+        answer,
+    ))
+    if not generic:
+        return answer
+
+    opening = "Bedankt om contact op te nemen met Reactify, ik ben de virtuele assistent."
+    lower = customer.lower()
+    if re.search(r"\b(afspraak|boeken|inplannen|reservatie|beschikbaar)\b", lower):
+        return (
+            opening
+            + "\n\nGraag help ik je om een afspraak in te plannen. "
+            + "Ben je al klant bij Reactify?"
+        )
+    if re.search(r"\b(prijs|kost|tarief|offerte)\b", lower):
+        return opening + "\n\nGraag help ik je met je vraag over de prijs. Over welke dienst wil je meer informatie?"
+    return opening + "\n\nBedankt voor je vraag. Ik bekijk dit graag verder voor je."
+
 
 def extract_name_from_email_signature(text: str) -> str:
     """Herken een persoonsnaam direct onder een gebruikelijke e-mailafsluiting."""
