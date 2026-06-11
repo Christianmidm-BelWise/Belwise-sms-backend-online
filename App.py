@@ -1354,6 +1354,15 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 # Reeds geïmporteerd; dit is normaal door de UID-lookback.
                 continue
 
+            # Wanneer de afzenderheader geen bruikbare naam bevat, haal de naam uit
+            # bijvoorbeeld "Met vriendelijke groeten,\nVoornaam Achternaam".
+            signature_name = extract_name_from_email_signature(text_body)
+            if signature_name:
+                update_email_contact_name_from_signature(
+                    conv["id"], tenant["tenant_id"], signature_name
+                )
+                conv["contact_name"] = signature_name
+
             processed += 1
             analysis = classify_text_basic(subject + "\n" + text_body)
             current_status = conv.get("status") or "ai-active"
@@ -1454,6 +1463,67 @@ def maybe_sync_incoming_email(tenant: Dict[str, Any], min_interval_seconds: int 
     """Backwards-compatible niet-blokkerende wrapper voor bestaande codepaden."""
     return schedule_email_sync(tenant, min_interval_seconds=min_interval_seconds, force=False)
 
+def get_contact_context(tenant_id: str, contact_key: str) -> Dict[str, str]:
+    """Bouw veilige Retell-context uit het bestaande Reactify-profiel en recente gesprekken."""
+    context = {
+        "customer_name": "",
+        "customer_email": "",
+        "customer_phone": "",
+        "conversation_summary": "",
+        "recent_conversation": "",
+    }
+    if not db_available() or not tenant_id or not contact_key:
+        return context
+
+    is_email = str(contact_key).startswith("email:")
+    email = str(contact_key).split(":", 1)[1].strip().lower() if is_email else ""
+    phone = "" if is_email else normalize_phone(contact_key)
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                if is_email:
+                    cur.execute("""
+                        SELECT id, contact_name, contact_email, contact_phone, summary
+                        FROM conversations
+                        WHERE tenant_id = %s AND LOWER(COALESCE(contact_email, '')) = %s
+                        ORDER BY updated_at DESC LIMIT 1;
+                    """, (tenant_id, email))
+                else:
+                    cur.execute("""
+                        SELECT id, contact_name, contact_email, contact_phone, summary
+                        FROM conversations
+                        WHERE tenant_id = %s AND contact_phone = %s
+                        ORDER BY updated_at DESC LIMIT 1;
+                    """, (tenant_id, phone))
+                row = cur.fetchone()
+                if not row:
+                    context["customer_email"] = email
+                    context["customer_phone"] = phone
+                    return context
+
+                conversation_id, name, stored_email, stored_phone, summary = row
+                cur.execute("""
+                    SELECT direction, body FROM conversation_messages
+                    WHERE conversation_id = %s
+                    ORDER BY created_at DESC LIMIT 10;
+                """, (conversation_id,))
+                recent = list(reversed(cur.fetchall()))
+
+        context.update({
+            "customer_name": (name or "").strip(),
+            "customer_email": (stored_email or email or "").strip().lower(),
+            "customer_phone": (stored_phone or phone or "").strip(),
+            "conversation_summary": (summary or "").strip(),
+            "recent_conversation": "\n".join(
+                f"{'Klant' if direction == 'incoming' else 'Reactify'}: {(body or '').strip()}"
+                for direction, body in recent if (body or '').strip()
+            )[-5000:],
+        })
+    except Exception as exc:
+        log(f"⚠️ get_contact_context failed: {exc}")
+    return context
+
+
 def get_or_create_chat_id(tenant: Dict[str, Any], contact_key: str) -> Optional[str]:
     """Maak of hergebruik één Retell-chatsessie per tenant en contact/kanaal."""
     key = (tenant["tenant_id"], contact_key)
@@ -1519,6 +1589,65 @@ def ask_retell_via_email(tenant: Dict[str, Any], email_address: str, subject: st
     except Exception as exc:
         log(f"⚠️ Retell email completion error: {exc}")
     return opening
+
+def extract_name_from_email_signature(text: str) -> str:
+    """Herken een persoonsnaam direct onder een gebruikelijke e-mailafsluiting."""
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw.strip():
+        return ""
+    lines = [re.sub(r"\s+", " ", line).strip(" \t,;:-") for line in raw.split("\n")]
+    closing = re.compile(
+        r"^(?:met\s+)?(?:vriendelijke|hartelijke)\s+groet(?:en)?$|"
+        r"^groet(?:en)?$|^mvg$|^kind\s+regards$|^best\s+regards$|"
+        r"^regards$|^sincerely$|^cordialement$|^bien\s+à\s+vous$",
+        re.IGNORECASE,
+    )
+    blocked = {
+        "team", "reactify", "klantendienst", "customer service", "support",
+        "administratie", "sales", "marketing", "directie", "bedrijf",
+    }
+    for index, line in enumerate(lines):
+        if not closing.match(line):
+            continue
+        for candidate in lines[index + 1:index + 4]:
+            if not candidate:
+                continue
+            if "@" in candidate or re.search(r"https?://|www\.|\d{4,}", candidate, re.I):
+                continue
+            cleaned = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' .-]", "", candidate).strip(" .-")
+            words = [w for w in cleaned.split() if w]
+            if not 1 <= len(words) <= 5 or len(cleaned) < 2 or len(cleaned) > 70:
+                continue
+            if cleaned.lower() in blocked:
+                continue
+            if any(w.lower() in {"bv", "bvba", "nv", "vzw", "inc", "ltd", "company"} for w in words):
+                continue
+            return " ".join(word[:1].upper() + word[1:] for word in words)
+    return ""
+
+
+def update_email_contact_name_from_signature(conversation_id: str, tenant_id: str, signature_name: str) -> None:
+    """Vervang alleen een generieke e-mailnaam door de naam uit de handtekening."""
+    name = (signature_name or "").strip()
+    if not db_available() or not conversation_id or not tenant_id or not name:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE conversations
+                    SET contact_name = %s, updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s
+                      AND (
+                        contact_name IS NULL OR BTRIM(contact_name) = '' OR
+                        LOWER(contact_name) IN ('nieuwe lead', 'onbekende klant', 'klant') OR
+                        LOWER(contact_name) = LOWER(COALESCE(contact_email, '')) OR
+                        contact_name LIKE '%%@%%'
+                      );
+                """, (name, conversation_id, tenant_id))
+    except Exception as exc:
+        log(f"⚠️ Naam uit e-mailhandtekening opslaan mislukt: {exc}")
+
 
 def extract_contact_details(text: str) -> Dict[str, str]:
     """Haal een bruikbare naam en e-mail uit een SMS zonder bestaande gegevens te overschrijven met ruis."""
