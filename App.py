@@ -61,6 +61,12 @@ EMAIL_SYNC_LAST_RUN: Dict[str, datetime] = {}
 EMAIL_SYNC_LAST_RESULT: Dict[str, Dict[str, Any]] = {}
 EMAIL_REPLY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="reactify-email-reply")
 EMAIL_NETWORK_TIMEOUT = max(4, min(15, int(os.environ.get("EMAIL_NETWORK_TIMEOUT", "8"))))
+APP_STARTED_AT = datetime.now(timezone.utc)
+EMAIL_SYNC_EPOCH = (
+    (os.environ.get("RENDER_GIT_COMMIT") or "").strip()
+    or (os.environ.get("RENDER_DEPLOY_ID") or "").strip()
+    or "reactify-email-clean-start-2026-06-11-v6"
+)
 
 _CONVERSATION_TABLES_READY = False
 _CONVERSATION_TABLES_LOCK = threading.Lock()
@@ -508,6 +514,8 @@ def ensure_conversation_tables() -> None:
                     UPDATE conversations SET folder = 'inbox' WHERE folder IS NULL OR folder = '';
                     CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations (tenant_id, folder, updated_at DESC);
                     ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS last_imap_uid BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS sync_epoch TEXT NOT NULL DEFAULT '';
+                    ALTER TABLE tenant_email_settings ADD COLUMN IF NOT EXISTS sync_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                     """
                 )
         _CONVERSATION_TABLES_READY = True
@@ -937,7 +945,150 @@ def _email_bodies(message) -> Tuple[str, str]:
             text_body = content
     if not text_body and html_body:
         text_body = _strip_html(html_body)
+    text_body = _clean_email_text(text_body)
     return text_body.strip(), html_body.strip()
+
+
+
+def _clean_email_text(text: str) -> str:
+    """Maak een e-mail leesbaar voor de Reactify-chat.
+
+    Verwijdert tracking-URL's, technische linknotatie, unsubscribe-blokken,
+    doorgestuurde headers en lange geciteerde antwoordgeschiedenis.
+    """
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = unescape(value)
+    # Markdown/HTML-achtige links: label <url> en [label](url) -> label.
+    value = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", value, flags=re.I)
+    value = re.sub(r"<https?://[^>]+>", "", value, flags=re.I)
+    # Losse, zeer lange trackinglinks verwijderen; korte normale links behouden.
+    value = re.sub(r"https?://\S{90,}", "", value, flags=re.I)
+    # Stop vóór geciteerde mailgeschiedenis of technische headers.
+    cut_patterns = [
+        r"(?im)^\s*On .+ wrote:\s*$", r"(?im)^\s*Op .+ schreef .+:\s*$",
+        r"(?im)^\s*Van:\s+.+$", r"(?im)^\s*From:\s+.+$",
+        r"(?im)^\s*-{2,}\s*(Original Message|Oorspronkelijk bericht)\s*-{2,}\s*$",
+    ]
+    cut = len(value)
+    for pattern in cut_patterns:
+        match = re.search(pattern, value)
+        if match:
+            cut = min(cut, match.start())
+    value = value[:cut]
+    # Nieuwsbrief- en privacyvoetregels niet in de chat tonen.
+    footer = re.search(
+        r"(?im)^\s*(unsubscribe|uitschrijven|manage (your )?email preferences|"
+        r"privacy notice|bekijk in browser|view (this )?email in (your )?browser)\b.*$",
+        value,
+    )
+    if footer:
+        value = value[:footer.start()]
+    lines = []
+    for line in value.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            continue
+        # technische mailvelden en kale trackingregels overslaan
+        if re.match(r"(?i)^(message-id|references|in-reply-to|content-type|mime-version):", stripped):
+            continue
+        lines.append(line.rstrip())
+    value = "\n".join(lines)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    # Verwijder typische automatische AI-, tracking- en juridische voetnoten.
+    noisy_patterns = [
+        r"(?im)^.*powered by ai.*$",
+        r"(?im)^.*generated (by|using) (an )?ai.*$",
+        r"(?im)^.*this (email|message) was sent automatically.*$",
+        r"(?im)^.*do not reply to this (email|message).*$",
+        r"(?im)^.*privacy policy.*$",
+        r"(?im)^.*terms (of use|and conditions).*$",
+        r"(?im)^.*cookie policy.*$",
+        r"(?im)^.*manage (your )?(email )?preferences.*$",
+        r"(?im)^.*unsubscribe.*$",
+    ]
+    for pattern in noisy_patterns:
+        value = re.sub(pattern, "", value)
+    # Verwijder code-/templateblokken die geen normale e-mailtekst zijn.
+    value = re.sub(r"(?s)```.*?```", "", value)
+    value = re.sub(r"(?m)^\s*[{}\[\]<>]{2,}.*$", "", value)
+    value = re.sub(r"(?m)^\s*(?:var|const|let|function|SELECT|INSERT|UPDATE|DELETE)\b.*$", "", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def _current_imap_uid(client) -> int:
+    status, data = client.uid("search", None, "ALL")
+    ids = (data[0] or b"").split() if status == "OK" and data else []
+    try:
+        return int(ids[-1]) if ids else 0
+    except Exception:
+        return 0
+
+
+def _imap_uid_before_app_start(client) -> int:
+    """Vind het laatste bericht dat al bestond vóór deze backend-deploy.
+
+    Zo worden mails die na het starten van de nieuwe deploy aankomen niet
+    overgeslagen, ook wanneer de eerste synchronisatie pas wat later gebeurt.
+    """
+    status, data = client.uid("search", None, "ALL")
+    ids = (data[0] or b"").split() if status == "OK" and data else []
+    if not ids:
+        return 0
+
+    baseline = 0
+    # Alleen het recente einde van de mailbox hoeft onderzocht te worden.
+    for uid_value in ids[-500:]:
+        try:
+            numeric_uid = int(uid_value)
+        except Exception:
+            continue
+        status, rows = client.uid("fetch", uid_value, "(INTERNALDATE)")
+        if status != "OK" or not rows:
+            continue
+        metadata = next((row[0] for row in rows if isinstance(row, tuple) and row), b"")
+        if not isinstance(metadata, (bytes, bytearray)):
+            continue
+        match = re.search(rb'INTERNALDATE "([^"]+)"', metadata)
+        if not match:
+            continue
+        try:
+            received_at = datetime.strptime(match.group(1).decode("ascii"), "%d-%b-%Y %H:%M:%S %z")
+        except Exception:
+            continue
+        if received_at < APP_STARTED_AT:
+            baseline = max(baseline, numeric_uid)
+    return baseline
+
+
+def _apply_email_deploy_cutoff(tenant: Dict[str, Any], client) -> Tuple[bool, int]:
+    """Begin per Render-deploy vanaf het deploymoment en wis oude mailimport."""
+    tenant_id = tenant["tenant_id"]
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT sync_epoch, last_imap_uid FROM tenant_email_settings WHERE tenant_id = %s FOR UPDATE;",
+                (tenant_id,),
+            )
+            row = cur.fetchone()
+            current_epoch = (row[0] or "") if row else ""
+            current_uid = int(row[1] or 0) if row else 0
+            if current_epoch == EMAIL_SYNC_EPOCH:
+                return False, current_uid
+
+            baseline_uid = _imap_uid_before_app_start(client)
+            cur.execute(
+                """
+                UPDATE tenant_email_settings
+                SET last_imap_uid = %s, sync_epoch = %s, sync_started_at = %s, updated_at = NOW()
+                WHERE tenant_id = %s;
+                """,
+                (baseline_uid, EMAIL_SYNC_EPOCH, APP_STARTED_AT, tenant_id),
+            )
+            # Oude e-mailgesprekken en berichten verdwijnen uit Reactify; de mailbox zelf blijft onaangeroerd.
+            cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND channel = 'email';", (tenant_id,))
+    log(f"✅ E-mailstartpunt ingesteld op deploymoment, baseline UID={baseline_uid} tenant={tenant_id}")
+    return True, baseline_uid
 
 
 def _normalized_subject(value: str) -> str:
@@ -1105,19 +1256,28 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
 
     processed = scanned = queued_replies = 0
     client = None
-    saved_uid = int(settings.get("lastImapUid") or 0)
-    highest_uid = saved_uid
+    saved_uid = 0
+    highest_uid = 0
     try:
         client = _imap_connect(settings)
         status, _ = client.select("INBOX", readonly=True)
         if status != "OK":
             raise RuntimeError("De INBOX kon niet worden geopend.")
 
-        # Kijk bij elke synchronisatie ook een beperkt aantal oudere UID's terug.
-        # Zo gaan e-mails niet verloren wanneer een vorige verwerking halverwege faalde.
+        initialized, baseline_uid = _apply_email_deploy_cutoff(tenant, client)
+        if initialized:
+            return {
+                "processed": 0, "replied": 0, "queuedReplies": 0, "scanned": 0,
+                "enabled": True, "initialized": True, "lastUid": baseline_uid,
+            }
+        settings = get_email_settings(tenant["tenant_id"], include_password=True) or settings
+        saved_uid = int(settings.get("lastImapUid") or baseline_uid or 0)
+        highest_uid = saved_uid
+
+        # Importeer uitsluitend berichten die NA het opgeslagen startpunt zijn aangekomen.
+        # Geen UID-lookback: anders kunnen oude mails na een deploy opnieuw verschijnen.
         if saved_uid > 0:
-            lookback_from = max(1, saved_uid - 25)
-            status, data = client.uid("search", None, f"UID {lookback_from}:*")
+            status, data = client.uid("search", None, f"UID {saved_uid + 1}:*")
         else:
             status, data = client.uid("search", None, "ALL")
             initial_ids = (data[0] or b"").split() if status == "OK" and data else []
@@ -1175,7 +1335,14 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 continue
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE conversations SET folder = %s, deleted_at = NULL WHERE id = %s AND tenant_id = %s;", (target_folder, conv["id"], tenant["tenant_id"]))
+                    cur.execute(
+                        """UPDATE conversations
+                           SET folder = %s, deleted_at = NULL,
+                               status = CASE WHEN %s = 'spam' THEN 'inactive' ELSE status END,
+                               requires_human = CASE WHEN %s = 'spam' THEN FALSE ELSE requires_human END
+                           WHERE id = %s AND tenant_id = %s;""",
+                        (target_folder, target_folder, target_folder, conv["id"], tenant["tenant_id"]),
+                    )
 
             inserted = add_conversation_message(
                 conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
@@ -1770,11 +1937,13 @@ def conversations():
                             channel = COALESCE(NULLIF(%s, ''), channel),
                             subject = COALESCE(NULLIF(%s, ''), subject),
                             folder = COALESCE(NULLIF(%s, ''), folder),
+                            status = CASE WHEN %s IN ('spam','trash') THEN 'inactive' ELSE status END,
+                            requires_human = CASE WHEN %s IN ('spam','trash') THEN FALSE ELSE requires_human END,
                             deleted_at = CASE WHEN %s = 'trash' THEN NOW() WHEN %s IN ('inbox','spam') THEN NULL ELSE deleted_at END,
                             updated_at = NOW()
                         WHERE id = %s AND tenant_id = %s;
                         """,
-                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, conversation_id, tenant["tenant_id"]),
+                        (name.strip(), email.strip().lower(), normalized_phone, channel, subject, folder, folder, folder, folder, folder, conversation_id, tenant["tenant_id"]),
                     )
 
             if status:
@@ -1844,15 +2013,17 @@ def conversations():
                            c.recommended_action, c.suggested_reply, c.subject, c.external_thread_id, c.folder, c.deleted_at, c.created_at, c.updated_at,
                            lm.body AS last_message, lm.created_at AS last_message_at, lm.direction AS last_message_direction
                     FROM conversations c
+                    LEFT JOIN tenant_email_settings tes ON tes.tenant_id = c.tenant_id
                     LEFT JOIN LATERAL (
                       SELECT body, created_at, direction FROM conversation_messages m
                       WHERE m.conversation_id = c.id ORDER BY created_at DESC LIMIT 1
                     ) lm ON TRUE
                 """
+                cutoff_clause = " AND (c.channel <> 'email' OR tes.sync_started_at IS NULL OR c.created_at >= tes.sync_started_at)"
                 if requested_folder == "all":
-                    cur.execute(base_query + " WHERE c.tenant_id = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], limit))
+                    cur.execute(base_query + " WHERE c.tenant_id = %s" + cutoff_clause + " ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], limit))
                 else:
-                    cur.execute(base_query + " WHERE c.tenant_id = %s AND c.folder = %s ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], requested_folder, limit))
+                    cur.execute(base_query + " WHERE c.tenant_id = %s AND c.folder = %s" + cutoff_clause + " ORDER BY c.updated_at DESC LIMIT %s;", (tenant["tenant_id"], requested_folder, limit))
                 rows = cur.fetchall()
         data = []
         for r in rows:
