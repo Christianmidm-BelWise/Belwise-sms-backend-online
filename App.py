@@ -1146,7 +1146,12 @@ def send_email_message(tenant: Dict[str, Any], to_email: str, subject: str, body
     if references:
         msg["References"] = references
     signature = (settings.get("signature") or "").strip()
-    full_body = body.strip() + (("\n\n" + signature) if signature else "")
+    clean_body = body.strip()
+    has_closing = bool(re.search(
+        r"(?im)^\s*(?:met\s+)?(?:vriendelijke|hartelijke)\s+groet(?:en)?[,:]?\s*$",
+        clean_body,
+    ))
+    full_body = clean_body if (not signature or has_closing) else clean_body + "\n\n" + signature
     msg.set_content(full_body)
     try:
         host, port = settings["smtpHost"], int(settings.get("smtpPort") or 587)
@@ -1199,18 +1204,6 @@ def _read_conversation_status(conversation_id: str, tenant_id: str) -> str:
         log(f"⚠️ Kon e-mailgespreksstatus niet lezen: {exc}")
         return ""
 
-
-
-
-def _email_tenant_lock_key(tenant_id: str) -> int:
-    """Deterministische PostgreSQL advisory-lock voor e-mailsync en verwijderen.
-
-    Hierdoor kan een sync nooit tegelijk met een definitieve verwijdering voor
-    dezelfde tenant schrijven. Dit voorkomt dat een reeds opgehaald IMAP-bericht
-    net na het verwijderen opnieuw als gesprek wordt aangemaakt.
-    """
-    digest = hashlib.sha256(("reactify-email-lock:" + (tenant_id or "")).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 def _email_external_is_tombstoned(tenant_id: str, external_id: str) -> bool:
     if not tenant_id or not external_id or not db_available():
@@ -1289,6 +1282,48 @@ def _name_from_email_address(email_address: str) -> str:
     return " ".join(p.capitalize() for p in parts[:4])
 
 
+def ensure_ai_email_closing(text: str) -> str:
+    """Geef elk automatisch antwoord exact dezelfde Reactify AI-afsluiting."""
+    value = (text or "").strip()
+    # Verwijder een reeds gegenereerde afsluiting om dubbele handtekeningen te voorkomen.
+    value = re.sub(
+        r"(?is)\n{1,3}\s*(?:met\s+)?(?:vriendelijke|hartelijke)\s+groet(?:en)?[,:]?\s*\n+.*$",
+        "",
+        value,
+    ).strip()
+    return value + "\n\nVriendelijke groet,\nReactify AI"
+
+
+def get_name_from_recent_outgoing_email(conversation_id: str) -> str:
+    """Lees een voornaam uit een recente aanhef zoals 'Hallo Christian,'."""
+    if not db_available() or not conversation_id:
+        return ""
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT body FROM conversation_messages
+                    WHERE conversation_id = %s AND channel = 'email' AND direction = 'outgoing'
+                    ORDER BY created_at DESC LIMIT 5;
+                    """,
+                    (conversation_id,),
+                )
+                rows = cur.fetchall()
+        for (body,) in rows:
+            match = re.search(
+                r"(?im)^\s*(?:hallo|dag|beste|goedemorgen|goedemiddag|goedenavond)\s+([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,30})(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,30})?[,!]?\s*$",
+                (body or "") + "\n",
+            )
+            if match:
+                name = match.group(1).strip()
+                if name.lower() not in {"reactify", "klant", "team"}:
+                    return name
+    except Exception as exc:
+        log(f"⚠️ Naam uit recente e-mailaanhef lezen mislukt: {exc}")
+    return ""
+
+
 def _process_email_auto_reply(
     tenant: Dict[str, Any], conversation_id: str, recipient: str, subject: str,
     text_body: str, external_id: str, references: str, external_thread_id: str
@@ -1313,6 +1348,7 @@ def _process_email_auto_reply(
         if not reply:
             _release_email_auto_reply_claim(tenant_id, external_id)
             return
+        reply = ensure_ai_email_closing(reply)
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         ok, sent_id, error = send_email_message(
             tenant, recipient, reply_subject, reply,
@@ -1329,7 +1365,12 @@ def _process_email_auto_reply(
             external_id=sent_id, sender_type="ai", subject=reply_subject,
             external_thread_id=external_thread_id, in_reply_to=external_id,
         )
-        set_conversation_status(conversation_id, tenant_id, "ai-active", False)
+        if reply_confirms_booking(reply):
+            mark_conversation_completed(conversation_id, tenant_id)
+            SMS_SESSIONS.pop((tenant_id, f"email:{recipient.strip().lower()}"), None)
+            log(f"✅ Afspraak bevestigd via e-mail; gesprek afgerond={conversation_id}")
+        else:
+            set_conversation_status(conversation_id, tenant_id, "ai-active", False)
         _mark_email_auto_reply_sent(tenant_id, external_id)
         log(f"✅ Automatisch e-mailantwoord verzonden gesprek={conversation_id}")
     except Exception as exc:
@@ -1364,17 +1405,9 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
 
     processed = scanned = queued_replies = 0
     client = None
-    email_lock_conn = None
     saved_uid = 0
     highest_uid = 0
     try:
-        # Houd gedurende de volledige synchronisatie een database-lock vast.
-        # Zo kan definitief verwijderen niet racen met een reeds lopende IMAP-import.
-        if db_available():
-            email_lock_conn = psycopg2.connect(DATABASE_URL)
-            with email_lock_conn.cursor() as lock_cur:
-                lock_cur.execute("SELECT pg_advisory_lock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
-
         client = _imap_connect(settings)
         status, _ = client.select("INBOX", readonly=True)
         if status != "OK":
@@ -1463,18 +1496,6 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                         (target_folder, target_folder, target_folder, conv["id"], tenant["tenant_id"]),
                     )
 
-            # Controleer opnieuw vlak vóór opslag. Dit is extra bescherming
-            # wanneer het gesprek tijdens dezelfde synchronisatieronde verwijderd werd.
-            if _email_external_is_tombstoned(tenant["tenant_id"], external_id):
-                with psycopg2.connect(DATABASE_URL) as cleanup_conn:
-                    with cleanup_conn.cursor() as cleanup_cur:
-                        cleanup_cur.execute(
-                            "DELETE FROM conversations c WHERE c.id = %s AND c.tenant_id = %s "
-                            "AND NOT EXISTS (SELECT 1 FROM conversation_messages m WHERE m.conversation_id = c.id);",
-                            (conv["id"], tenant["tenant_id"]),
-                        )
-                continue
-
             inserted = add_conversation_message(
                 conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
                 external_id=external_id, sender_type="customer", subject=subject,
@@ -1488,11 +1509,13 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
             # Wanneer de afzenderheader geen bruikbare naam bevat, haal de naam uit
             # bijvoorbeeld "Met vriendelijke groeten,\nVoornaam Achternaam".
             signature_name = extract_name_from_email_signature(text_body)
-            if signature_name:
+            context_name = get_name_from_recent_outgoing_email(conv["id"])
+            detected_name = signature_name or context_name
+            if detected_name:
                 update_email_contact_name_from_signature(
-                    conv["id"], tenant["tenant_id"], signature_name
+                    conv["id"], tenant["tenant_id"], detected_name
                 )
-                conv["contact_name"] = signature_name
+                conv["contact_name"] = detected_name
 
             processed += 1
             analysis = classify_text_basic(subject + "\n" + text_body)
@@ -1538,13 +1561,6 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 client.logout()
         except Exception:
             pass
-        try:
-            if email_lock_conn:
-                with email_lock_conn.cursor() as lock_cur:
-                    lock_cur.execute("SELECT pg_advisory_unlock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
-                email_lock_conn.close()
-        except Exception as exc:
-            log(f"⚠️ E-mail database-lock vrijgeven mislukt: {exc}")
         EMAIL_SYNC_LOCK.release()
 
 
@@ -1783,7 +1799,9 @@ def update_email_contact_name_from_signature(conversation_id: str, tenant_id: st
                         contact_name IS NULL OR BTRIM(contact_name) = '' OR
                         LOWER(contact_name) IN ('nieuwe lead', 'onbekende klant', 'klant') OR
                         LOWER(contact_name) = LOWER(COALESCE(contact_email, '')) OR
-                        contact_name LIKE '%%@%%'
+                        contact_name LIKE '%%@%%' OR
+                        LOWER(REGEXP_REPLACE(contact_name, '[^a-z0-9]', '', 'g')) =
+                        LOWER(REGEXP_REPLACE(SPLIT_PART(COALESCE(contact_email, ''), '@', 1), '[^a-z0-9]', '', 'g'))
                       );
                 """, (name, conversation_id, tenant_id))
     except Exception as exc:
@@ -2193,9 +2211,6 @@ def conversations():
             conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
-                    # Wacht tot een lopende e-mailsync klaar is. Daarna worden
-                    # tombstones en verwijdering atomair uitgevoerd.
-                    cur.execute("SELECT pg_advisory_xact_lock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
                     if action == "empty-trash":
                         cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND folder = 'trash' RETURNING id;", (tenant["tenant_id"],))
                         ids = [r[0] for r in cur.fetchall()]
