@@ -1200,6 +1200,18 @@ def _read_conversation_status(conversation_id: str, tenant_id: str) -> str:
         return ""
 
 
+
+
+def _email_tenant_lock_key(tenant_id: str) -> int:
+    """Deterministische PostgreSQL advisory-lock voor e-mailsync en verwijderen.
+
+    Hierdoor kan een sync nooit tegelijk met een definitieve verwijdering voor
+    dezelfde tenant schrijven. Dit voorkomt dat een reeds opgehaald IMAP-bericht
+    net na het verwijderen opnieuw als gesprek wordt aangemaakt.
+    """
+    digest = hashlib.sha256(("reactify-email-lock:" + (tenant_id or "")).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+
 def _email_external_is_tombstoned(tenant_id: str, external_id: str) -> bool:
     if not tenant_id or not external_id or not db_available():
         return False
@@ -1352,9 +1364,17 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
 
     processed = scanned = queued_replies = 0
     client = None
+    email_lock_conn = None
     saved_uid = 0
     highest_uid = 0
     try:
+        # Houd gedurende de volledige synchronisatie een database-lock vast.
+        # Zo kan definitief verwijderen niet racen met een reeds lopende IMAP-import.
+        if db_available():
+            email_lock_conn = psycopg2.connect(DATABASE_URL)
+            with email_lock_conn.cursor() as lock_cur:
+                lock_cur.execute("SELECT pg_advisory_lock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
+
         client = _imap_connect(settings)
         status, _ = client.select("INBOX", readonly=True)
         if status != "OK":
@@ -1443,6 +1463,18 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                         (target_folder, target_folder, target_folder, conv["id"], tenant["tenant_id"]),
                     )
 
+            # Controleer opnieuw vlak vóór opslag. Dit is extra bescherming
+            # wanneer het gesprek tijdens dezelfde synchronisatieronde verwijderd werd.
+            if _email_external_is_tombstoned(tenant["tenant_id"], external_id):
+                with psycopg2.connect(DATABASE_URL) as cleanup_conn:
+                    with cleanup_conn.cursor() as cleanup_cur:
+                        cleanup_cur.execute(
+                            "DELETE FROM conversations c WHERE c.id = %s AND c.tenant_id = %s "
+                            "AND NOT EXISTS (SELECT 1 FROM conversation_messages m WHERE m.conversation_id = c.id);",
+                            (conv["id"], tenant["tenant_id"]),
+                        )
+                continue
+
             inserted = add_conversation_message(
                 conv["id"], tenant["tenant_id"], "incoming", text_body, "email",
                 external_id=external_id, sender_type="customer", subject=subject,
@@ -1506,6 +1538,13 @@ def sync_incoming_email(tenant: Dict[str, Any], limit: int = 25) -> Dict[str, An
                 client.logout()
         except Exception:
             pass
+        try:
+            if email_lock_conn:
+                with email_lock_conn.cursor() as lock_cur:
+                    lock_cur.execute("SELECT pg_advisory_unlock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
+                email_lock_conn.close()
+        except Exception as exc:
+            log(f"⚠️ E-mail database-lock vrijgeven mislukt: {exc}")
         EMAIL_SYNC_LOCK.release()
 
 
@@ -2154,6 +2193,9 @@ def conversations():
             conversation_id = (body.get("conversationId") or body.get("conversation_id") or request.args.get("conversationId") or request.args.get("id") or "").strip()
             with psycopg2.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
+                    # Wacht tot een lopende e-mailsync klaar is. Daarna worden
+                    # tombstones en verwijdering atomair uitgevoerd.
+                    cur.execute("SELECT pg_advisory_xact_lock(%s);", (_email_tenant_lock_key(tenant["tenant_id"]),))
                     if action == "empty-trash":
                         cur.execute("DELETE FROM conversations WHERE tenant_id = %s AND folder = 'trash' RETURNING id;", (tenant["tenant_id"],))
                         ids = [r[0] for r in cur.fetchall()]
